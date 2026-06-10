@@ -313,24 +313,38 @@ impl Sim {
                 return; // §2: can't break a chest while non-empty
             }
             self.world.chests.remove(&(ox, oy));
+            // Breaking an (empty) chest someone has open releases its §11
+            // lock; the opener's client drops its panel on the TileChanged.
+            if let Some(&holder) = self.chest_locks.get(&(ox, oy)) {
+                self.release_chest(holder);
+            }
         }
         let (w, h) = (data.size.0 as u32, data.size.1 as u32);
+        // Bottles placed on a Table/Workbench (§4.4 Bottle station) pop
+        // back off with the furniture. (`BOTTLE_ON_TOP` shares its bit with
+        // `DOOR_OPEN`, hence the id guard.)
+        let mut bottles: u16 = 0;
         for dy in 0..h {
             for dx in 0..w {
                 if self.world.tile(ox + dx, oy + dy).id == id {
                     let mut t = self.world.tile(ox + dx, oy + dy);
+                    if matches!(id, TileId::Table | TileId::Workbench)
+                        && t.state & state::BOTTLE_ON_TOP != 0
+                    {
+                        bottles += 1;
+                    }
                     t.id = TileId::Air;
                     t.state &= state::WALL_PLACED;
                     self.change_tile(ox + dx, oy + dy, t);
                 }
             }
         }
+        let center = (ox as f32 + w as f32 / 2.0, oy as f32 + h as f32 / 2.0);
         if let Some((item, n)) = data.drops {
-            self.spawn_item_drop(
-                item,
-                n as u16,
-                (ox as f32 + w as f32 / 2.0, oy as f32 + h as f32 / 2.0),
-            );
+            self.spawn_item_drop(item, n as u16, center);
+        }
+        if bottles > 0 {
+            self.spawn_item_drop(ItemId::Bottle, bottles, center);
         }
     }
 
@@ -350,6 +364,12 @@ impl Sim {
             return;
         };
         let Some(Placement::Tile(tile_id)) = stack.item.data().places else {
+            // A Bottle isn't a tile: placing it onto a Table/Workbench cell
+            // sets `state::BOTTLE_ON_TOP`, enabling the Bottle crafting
+            // station (§4.4). Breaking the furniture returns the bottle.
+            if stack.item == ItemId::Bottle {
+                self.place_bottle(id, x, y, slot);
+            }
             return;
         };
         let data = tile_id.data();
@@ -637,6 +657,25 @@ impl Sim {
                 .map
                 .values()
                 .any(|e| overlaps(e.pos, e.size()))
+    }
+
+    /// Places a Bottle from `slot` onto the Table/Workbench cell `(x, y)`
+    /// (`state::BOTTLE_ON_TOP`, the §4.4 Bottle station). One per cell.
+    fn place_bottle(&mut self, id: u32, x: u32, y: u32, slot: u8) {
+        let Some(p) = self.players.get(&id) else {
+            return;
+        };
+        if !tile_in_reach(p.center(), x, y) {
+            return;
+        }
+        let mut t = self.world.tile(x, y);
+        if !matches!(t.id, TileId::Table | TileId::Workbench) || t.state & state::BOTTLE_ON_TOP != 0
+        {
+            return;
+        }
+        t.state |= state::BOTTLE_ON_TOP;
+        self.change_tile(x, y, t);
+        self.consume_item(id, slot);
     }
 
     /// Removes one item from `slot`, pushing the delta to the owner (and a
@@ -932,6 +971,69 @@ mod tests {
             ItemId::Gel => assert!((1..=4).contains(&count)),
             other => panic!("{other:?} not in the §2.3 pot table"),
         }
+    }
+
+    #[test]
+    fn bottle_placement_enables_the_station_and_returns_on_break() {
+        use ferraria_shared::crafting::{stations_in_range, Station};
+
+        let (mut sim, id, epoch, _rx) = setup();
+        // A workbench two tiles past the pickup radius (see the mining
+        // test), with bottles in hand.
+        let (bx, by) = (54, FLOOR - 1);
+        assert!(sim.world.place_multitile(bx, by, TileId::Workbench));
+        give(&mut sim, id, 0, ItemId::Bottle, 2);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x: bx,
+                y: by,
+                hotbar_slot: 0,
+            },
+        );
+        assert!(
+            sim.world().tile(bx, by).state & state::BOTTLE_ON_TOP != 0,
+            "bottle sits on the bench"
+        );
+        assert_eq!(
+            sim.players[&id].inventory[0],
+            Some(InvSlot::new(ItemId::Bottle, 1)),
+            "one bottle consumed"
+        );
+        // In reach to place (6) is farther than the station range (4):
+        // standing next to the bench the Bottle station registers.
+        let near_bench = (bx as f32 - 1.0, by as f32);
+        assert!(stations_in_range(sim.world(), near_bench).contains(Station::Bottle));
+        let center = sim.players[&id].center();
+        assert!(
+            !stations_in_range(sim.world(), center).contains(Station::Bottle),
+            "placement reach exceeds the station range"
+        );
+
+        // The cell already has one: refused, nothing consumed.
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x: bx,
+                y: by,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(
+            sim.players[&id].inventory[0],
+            Some(InvSlot::new(ItemId::Bottle, 1))
+        );
+
+        // Breaking the bench pops the bottle back off alongside it.
+        give(&mut sim, id, 0, ItemId::WoodPickaxe, 1);
+        swing_tile(&mut sim, id, epoch, bx, by);
+        assert_eq!(sim.world().tile(bx, by).id, TileId::Air);
+        assert_eq!(dropped(&sim, ItemId::Workbench), 1);
+        assert_eq!(dropped(&sim, ItemId::Bottle), 1);
     }
 
     #[test]

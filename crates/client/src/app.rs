@@ -11,7 +11,7 @@ use ferraria_shared::items::{inventory, ArmorSlot, InvSlot, ItemId};
 use ferraria_shared::loadout;
 use ferraria_shared::physics::{PhysicsMods, PlayerInput, PLAYER_HEIGHT, PLAYER_WIDTH};
 use ferraria_shared::protocol::{AuthToken, ClientMessage, ServerMessage};
-use ferraria_shared::tiles::{MINING_HELMET_LIGHT, PLAYER_GLOW};
+use ferraria_shared::tiles::{TileId, MINING_HELMET_LIGHT, PLAYER_GLOW};
 use ferraria_shared::world::{chest_in_reach, WorldFlags, DAY_TICKS};
 use ferraria_shared::{MAX_NAME_CHARS, PROTOCOL_VERSION, TICK_RATE, TILE_SIZE};
 
@@ -369,9 +369,12 @@ impl Session {
         }
 
         // Chest follows reach (§11): walking away closes it on both sides.
+        // A chest that stopped existing (someone broke it) closes too — the
+        // server already released its lock with the break.
         let center = self.own.phys.center();
         if let Some(c) = &self.chest {
-            if !chest_in_reach(center, c.origin) {
+            let broken = self.view.world().tile(c.origin.0, c.origin.1).id != TileId::Chest;
+            if broken || !chest_in_reach(center, c.origin) {
                 self.chest = None;
                 self.ws.send(&ClientMessage::CloseChest);
             }
@@ -491,8 +494,12 @@ impl Session {
         self.hud
             .draw(self.remotes.len() + 1, self.clock.day, self.clock.ticks());
         let mut ui_msgs: Vec<ClientMessage> = Vec::new();
-        self.inv_ui
-            .frame(&self.inventory, self.chest.as_ref(), self.selected, &mut ui_msgs);
+        self.inv_ui.frame(
+            &self.inventory,
+            self.chest.as_ref(),
+            self.selected,
+            &mut ui_msgs,
+        );
         if self.inv_ui.open {
             let stations = stations_in_range(self.view.world(), self.own.phys.center());
             self.craft_ui

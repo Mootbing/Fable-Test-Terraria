@@ -51,15 +51,12 @@ impl Sim {
         let left = stack.count - count;
         let new = (left > 0).then_some(InvSlot::new(stack.item, left));
         p.inventory[idx] = new;
-        let name = stack.item.data().name;
-        // INTEGRATE(drop-entity): spawn a world item-drop entity for
-        // (stack.item, count) at the player's feet here (ItemDropSpawn
-        // broadcast + first-pickup-wins tracking) once the item-drop branch
-        // lands; until then dropping removes the items and tells everyone.
+        let center = p.center();
         self.send_slot_deltas(id, &[(SlotAddr::Inv(idx), new)]);
-        self.broadcast(&ServerMessage::Toast {
-            text: format!("Dropped {count} {name}"),
-        });
+        // The stack pops out as a world item drop at the player and is
+        // world-shared from then on — first pickup wins (§11), including
+        // the dropper after the standard arming delay.
+        self.spawn_item_drop(stack.item, count, center);
     }
 
     // ---- Crafting (§4.4) -----------------------------------------------------
@@ -100,11 +97,12 @@ impl Sim {
             .map(|(i, _)| (SlotAddr::Inv(i), crafting[i]))
             .collect();
         let output_name = recipe.output.data().name;
+        let center = p.center();
         self.send_slot_deltas(id, &deltas);
         if overflow > 0 {
-            // INTEGRATE(drop-entity): the part of the output that didn't fit
-            // ((recipe.output, overflow)) spawns as an item drop at the
-            // player's feet once the item-drop branch lands.
+            // §4.4: crafting always yields its output — the part that
+            // didn't fit pops out as a world item drop at the crafter.
+            self.spawn_item_drop(recipe.output, overflow, center);
             self.send_to(
                 id,
                 &ServerMessage::Toast {
@@ -723,6 +721,62 @@ mod tests {
     }
 
     #[test]
+    fn breaking_an_open_empty_chest_releases_the_lock() {
+        let mut sim = test_sim();
+        let (a, a_epoch, mut rx_a) = join(&mut sim, "alice", None);
+        drain(&mut rx_a);
+        let center = sim.players[&a].center();
+        let (cx, cy) = (center.0 as u32 + 2, center.1 as u32);
+        assert!(sim.world.place_multitile(cx, cy, TileId::Chest));
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::OpenChest { x: cx, y: cy },
+        );
+        assert!(!sim.chest_locks.is_empty());
+
+        sim.break_tile(cx, cy);
+        assert_eq!(sim.world.tile(cx, cy).id, TileId::Air, "empty chest broke");
+        assert!(sim.chest_locks.is_empty(), "the break released the lock");
+        assert!(sim.players[&a].open_chest.is_none());
+    }
+
+    #[test]
+    fn craft_overflow_spawns_an_item_drop() {
+        let (mut sim, id, epoch, mut rx) = sim_with_player();
+        // Recipe 2 (torch ×3 at Hands) with no room for the output: every
+        // crafting slot full, and the inputs don't empty a slot.
+        {
+            let p = sim.players.get_mut(&id).expect("player");
+            for i in inventory::CRAFTING_SLOTS {
+                p.inventory[i] = Some(InvSlot::new(ItemId::Stone, ItemId::Stone.max_stack()));
+            }
+            p.inventory[0] = Some(InvSlot::new(ItemId::Wood, 2));
+            p.inventory[1] = Some(InvSlot::new(ItemId::Gel, 2));
+        }
+        msg(&mut sim, id, epoch, ClientMessage::Craft { recipe_id: 2 });
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ServerMessage::ItemDropSpawn {
+                    item: ItemId::Torch,
+                    count: 3,
+                    ..
+                }
+            )),
+            "the whole output overflowed into a world drop: {msgs:?}"
+        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, ServerMessage::Toast { text } if text.contains("inventory full"))
+        ));
+        // Inputs were still consumed (§4.4: crafting always yields).
+        assert_eq!(slot(&sim, id, 0), Some(InvSlot::new(ItemId::Wood, 1)));
+        assert_eq!(slot(&sim, id, 1), Some(InvSlot::new(ItemId::Gel, 1)));
+    }
+
+    #[test]
     fn drop_item_validates_slot_and_count() {
         let (mut sim, id, epoch, mut rx) = sim_with_player();
         // Bad counts: nothing happens.
@@ -747,7 +801,8 @@ mod tests {
         assert!(drain(&mut rx).is_empty());
         assert_eq!(slot(&sim, id, 3), Some(InvSlot::new(ItemId::Torch, 5)));
 
-        // Valid drop removes the items and toasts.
+        // Valid drop removes the items and spawns a world item-drop entity
+        // at the player (world-shared, first pickup wins).
         msg(
             &mut sim,
             id,
@@ -756,9 +811,23 @@ mod tests {
         );
         let msgs = drain(&mut rx);
         assert!(slot_changes(&msgs).contains(&(3, Some(InvSlot::new(ItemId::Torch, 3)))));
-        assert!(msgs.iter().any(
-            |m| matches!(m, ServerMessage::Toast { text } if text.contains("Dropped 2 Torch"))
-        ));
+        let center = sim.players[&id].center();
+        let pos = msgs
+            .iter()
+            .find_map(|m| match m {
+                ServerMessage::ItemDropSpawn {
+                    item: ItemId::Torch,
+                    count: 2,
+                    pos,
+                    ..
+                } => Some(*pos),
+                _ => None,
+            })
+            .expect("dropping spawned an item-drop entity");
+        assert!(
+            (pos.0 - center.0).abs() < 2.0 && (pos.1 - center.1).abs() < 2.0,
+            "drop spawns at the player, got {pos:?} vs {center:?}"
+        );
 
         // Dropping the whole stack empties the slot.
         msg(

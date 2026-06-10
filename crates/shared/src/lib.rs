@@ -23,7 +23,11 @@ pub use physics::{GRAVITY, TERMINAL_VELOCITY};
 
 /// Protocol version; bumped on every breaking wire change. The server
 /// rejects clients with a mismatching version at handshake.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: the feature merge train (world-interact, lighting/day-night,
+/// inventory/crafting) appended `ClientMessage`/`ServerMessage` variants in
+/// a different order than any single pre-merge build understood.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// World tiles are 16x16 px on screen; physics positions are in tile units.
 pub const TILE_SIZE: f32 = 16.0;

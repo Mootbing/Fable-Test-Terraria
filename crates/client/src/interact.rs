@@ -12,7 +12,7 @@ use macroquad::prelude::*;
 
 use ferraria_shared::items::{InvSlot, ItemId, Placement, BARE_HAND_USE_SECS};
 use ferraria_shared::protocol::ClientMessage;
-use ferraria_shared::tiles::{TileId, ToolKind, WallId, TILE_DAMAGE_RESET_SECS};
+use ferraria_shared::tiles::{state, TileId, ToolKind, WallId, TILE_DAMAGE_RESET_SECS};
 use ferraria_shared::world::World;
 use ferraria_shared::{tile_in_reach, TILE_SIZE};
 
@@ -115,8 +115,10 @@ impl Interact {
             }
         }
 
-        // RMB press: doors toggle, chests open (the panel is the inventory
-        // branch's job — we only send the intent).
+        // RMB press: doors toggle, chests open (the chest panel itself is
+        // `ui::inventory`'s job — we only send the intent), and a held
+        // Bottle goes onto a Table/Workbench cell (the §4.4 Bottle station;
+        // wire-wise a normal `PlaceTile`).
         if is_mouse_button_pressed(MouseButton::Right) {
             match t.id {
                 TileId::Door => {
@@ -126,6 +128,16 @@ impl Interact {
                 TileId::Chest => {
                     let (ox, oy) = world.multitile_origin(x, y);
                     ws.send(&ClientMessage::OpenChest { x: ox, y: oy });
+                    return;
+                }
+                TileId::Table | TileId::Workbench
+                    if held == Some(ItemId::Bottle) && t.state & state::BOTTLE_ON_TOP == 0 =>
+                {
+                    ws.send(&ClientMessage::PlaceTile {
+                        x,
+                        y,
+                        hotbar_slot: selected,
+                    });
                     return;
                 }
                 _ => {}

@@ -225,9 +225,8 @@ pub fn stations_in_range(world: &World, center: (f32, f32)) -> StationSet {
             if let Some(s) = t.id.data().station {
                 stations.insert(s);
             }
-            // INTEGRATE(bottle-placement): placing a Bottle item onto a
-            // Table/Workbench (setting BOTTLE_ON_TOP) ships with the world
-            // interaction branch; detection already works here.
+            // The server sets BOTTLE_ON_TOP when a Bottle item is placed
+            // onto a Table/Workbench cell (`sim::interact::place_bottle`).
             if matches!(t.id, TileId::Table | TileId::Workbench)
                 && t.state & state::BOTTLE_ON_TOP != 0
             {
