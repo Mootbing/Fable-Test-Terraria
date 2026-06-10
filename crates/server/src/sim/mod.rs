@@ -6,11 +6,14 @@
 //! Enemies, combat, and the rest of the tick pipeline arrive with later PRs
 //! and plug into [`game::Sim::tick`].
 
+pub mod combat;
+pub mod enemies;
 pub mod entities;
 pub mod fluids;
 pub mod game;
 pub mod interact;
 mod inventory;
+pub mod survival;
 pub mod world_tick;
 
 /// Shared helpers for the sim test suites (driving a [`game::Sim`] without

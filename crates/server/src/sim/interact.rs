@@ -117,11 +117,25 @@ impl Sim {
     pub(crate) fn hit_tile(&mut self, id: u32, x: u32, y: u32) {
         let tile = self.world.tile(x, y);
         let data = tile.id.data();
-        if tile.id == TileId::Air || !data.breakable {
-            // Ritual Altars are unbreakable (§2; the hammer-backlash damage
-            // arrives with the combat systems — there is no player HP here
-            // yet). Air is simply not a target.
+        if tile.id == TileId::RitualAltar {
+            // §2 tile 24: unbreakable; hammering it deals 50% of the
+            // striker's *current* HP (exact — no defense), altar unaffected.
+            let Some(tool) = self.accept_swing(id, x, y) else {
+                return;
+            };
+            if tool.is_some_and(|t| t.kind == ToolKind::Hammer) {
+                let hp = self.players.get(&id).map(|p| p.hp).unwrap_or(0);
+                let backlash = (hp as f32
+                    * ferraria_shared::tiles::RITUAL_ALTAR_BACKLASH_HP_FRACTION)
+                    as u32;
+                if backlash > 0 {
+                    self.hurt_player(id, backlash, super::survival::Hurt::Raw);
+                }
+            }
             return;
+        }
+        if tile.id == TileId::Air || !data.breakable {
+            return; // air is not a target; other unbreakables shrug
         }
         let Some(tool) = self.accept_swing(id, x, y) else {
             return;

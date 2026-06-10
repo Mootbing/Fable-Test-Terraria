@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use ferraria_shared::enemies::EnemyKind;
 use ferraria_shared::items::{add_to_inventory, ItemId};
 use ferraria_shared::physics::{hitbox, step_item_drop, ITEM_SPAWN_SPEED_X, ITEM_SPAWN_SPEED_Y};
 use ferraria_shared::protocol::{DespawnReason, EntityState, ServerMessage};
@@ -39,6 +40,47 @@ pub enum EntityKind {
     /// An unsupported sand tile in flight (§2 tile 4), stepped by
     /// `Sim::step_falling_sand` and converted back to a tile on landing.
     FallingSand,
+    /// A live §5 enemy (stats in `shared::enemies::ENEMY_DATA`; AI state in
+    /// [`Entity::ai`], HP in [`Entity::hp`]).
+    Enemy(EnemyKind),
+    /// A player-fired arrow (§4.1). `item` is the arrow kind in flight
+    /// (drives damage/burn/render and what a terrain recovery drops);
+    /// `attack` is the bow + arrow damage with the shooter's §4.3
+    /// multipliers already applied; `owner` the firing player.
+    Arrow {
+        item: ItemId,
+        attack: u16,
+        knockback: f32,
+        owner: u32,
+    },
+    /// An Ash Demon's Void Sickle (§5.2): hits players only.
+    VoidSickle,
+}
+
+/// Mutable per-entity AI scratch state, generic across the §5.2 archetypes
+/// (kept flat + `Copy` so [`Entity`] stays a plain value).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AiState {
+    /// Primary countdown, ticks (slime idle gap, bat jitter window, swooper
+    /// phase time, projectile lifetime).
+    pub timer: u32,
+    /// Secondary countdown, ticks (swooper volley cooldown).
+    pub timer2: u32,
+    /// Generic counter (slime hop index for the every-3rd high hop).
+    pub counter: u32,
+    /// Behavior phase (swooper: 0 hover / 1 swoop; fighters: unused).
+    pub phase: u8,
+    /// Facing/walk direction (±1).
+    pub dir: i8,
+    /// §5.1: surface slimes are passive by day until damaged.
+    pub passive: bool,
+    /// Dawn flee mode (§5.2 zombies / §9 demon eyes).
+    pub fleeing: bool,
+    /// Grounded at the end of the last step.
+    pub on_ground: bool,
+    /// Burning debuff remaining on this enemy, ticks (Ember Blade / flaming
+    /// arrow procs).
+    pub burn_ticks: u32,
 }
 
 /// One live entity. Positions are the AABB top-left in tile units, matching
@@ -52,13 +94,36 @@ pub struct Entity {
     pub spawn_tick: u64,
     /// Changed since the last snapshot batch; cleared after broadcasting.
     pub awake: bool,
+    /// Hit points (enemies; 0 for drops/projectiles).
+    pub hp: u16,
+    /// HP changed since the last snapshot batch (sent as `EntityState::hp`).
+    pub hp_dirty: bool,
+    /// AI scratch state (enemies/projectiles).
+    pub ai: AiState,
 }
 
 impl Entity {
+    /// A non-enemy entity (drops, falling sand, projectiles) at rest state.
+    pub fn plain(pos: (f32, f32), vel: (f32, f32), kind: EntityKind, spawn_tick: u64) -> Entity {
+        Entity {
+            pos,
+            vel,
+            kind,
+            spawn_tick,
+            awake: true,
+            hp: 0,
+            hp_dirty: false,
+            ai: AiState::default(),
+        }
+    }
+
     pub fn size(&self) -> (f32, f32) {
         match self.kind {
             EntityKind::ItemDrop { .. } => hitbox::ITEM_DROP,
             EntityKind::FallingSand => hitbox::FALLING_TILE,
+            EntityKind::Enemy(kind) => kind.data().size,
+            EntityKind::Arrow { .. } => hitbox::ARROW,
+            EntityKind::VoidSickle => hitbox::VOID_SICKLE,
         }
     }
 
@@ -118,7 +183,15 @@ impl Default for EntityStore {
     }
 }
 
-fn spawn_message(id: u32, e: &Entity) -> ServerMessage {
+pub(crate) fn spawn_message(id: u32, e: &Entity) -> ServerMessage {
+    use ferraria_shared::protocol::EntityKind as Wire;
+    let wire = |kind: Wire| ServerMessage::EntitySpawn {
+        id,
+        kind,
+        pos: e.pos,
+        vel: e.vel,
+        state: 0,
+    };
     match e.kind {
         EntityKind::ItemDrop { item, count } => ServerMessage::ItemDropSpawn {
             id,
@@ -127,13 +200,14 @@ fn spawn_message(id: u32, e: &Entity) -> ServerMessage {
             pos: e.pos,
             vel: e.vel,
         },
-        EntityKind::FallingSand => ServerMessage::EntitySpawn {
-            id,
-            kind: ferraria_shared::protocol::EntityKind::FallingSand,
-            pos: e.pos,
-            vel: e.vel,
-            state: 0,
-        },
+        EntityKind::FallingSand => wire(Wire::FallingSand),
+        EntityKind::Enemy(kind) => wire(kind.wire_kind()),
+        EntityKind::Arrow { item, .. } => wire(if item == ItemId::FlamingArrow {
+            Wire::FlamingArrowProjectile
+        } else {
+            Wire::ArrowProjectile
+        }),
+        EntityKind::VoidSickle => wire(Wire::VoidSickleProjectile),
     }
 }
 
@@ -177,13 +251,12 @@ impl Sim {
     /// tile 4: an unsupported sand tile leaves the grid and falls as an
     /// entity until it lands on a solid).
     pub(crate) fn spawn_falling_sand(&mut self, x: u32, y: u32) -> u32 {
-        let entity = Entity {
-            pos: (x as f32, y as f32),
-            vel: (0.0, 0.0),
-            kind: EntityKind::FallingSand,
-            spawn_tick: self.tick,
-            awake: true,
-        };
+        let entity = Entity::plain(
+            (x as f32, y as f32),
+            (0.0, 0.0),
+            EntityKind::FallingSand,
+            self.tick,
+        );
         let id = self.entities.insert(entity);
         let msg = spawn_message(id, &entity);
         self.broadcast_at(x, y, &msg);
@@ -201,13 +274,12 @@ impl Sim {
         spawn_tick: u64,
     ) -> u32 {
         let (w, h) = hitbox::ITEM_DROP;
-        let entity = Entity {
-            pos: (center.0 - w / 2.0, center.1 - h / 2.0),
+        let entity = Entity::plain(
+            (center.0 - w / 2.0, center.1 - h / 2.0),
             vel,
-            kind: EntityKind::ItemDrop { item, count },
+            EntityKind::ItemDrop { item, count },
             spawn_tick,
-            awake: true,
-        };
+        );
         let id = self.entities.insert(entity);
         let msg = spawn_message(id, &entity);
         self.broadcast_at(center.0.max(0.0) as u32, center.1.max(0.0) as u32, &msg);
@@ -430,7 +502,7 @@ impl Sim {
                         id,
                         pos: e.pos,
                         vel: e.vel,
-                        hp: None,
+                        hp: e.hp_dirty.then_some(e.hp),
                         state: 0,
                     },
                 )
@@ -454,6 +526,7 @@ impl Sim {
         }
         for e in self.entities.map.values_mut() {
             e.awake = false;
+            e.hp_dirty = false;
         }
     }
 }

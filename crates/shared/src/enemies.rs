@@ -102,6 +102,11 @@ pub const VOID_SICKLE_LIFETIME_SECS: f32 = 10.0;
 /// magnitudes; the small pop-up is canonized here).
 pub const KNOCKBACK_UP_MULT: f32 = 0.5;
 
+/// Knockback dealt *to players* by enemy contact and enemy projectiles,
+/// tiles/s (canonized — DESIGN pins player i-frames but not the shove;
+/// applied client-side via `ServerMessage::PlayerKnockback`).
+pub const PLAYER_KNOCKBACK_SPEED: f32 = 8.0;
+
 // ---- Burning on enemies --------------------------------------------------------
 
 /// Enemies burn at the same §8 rate as players (2 dmg/s, ignores defense) —
