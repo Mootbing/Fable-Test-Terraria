@@ -51,6 +51,9 @@ pub const RITUAL_ALTAR_BACKLASH_HP_FRACTION: f32 = 0.5;
 pub const LIGHT_MAX: u8 = 32;
 pub const SKY_LIGHT_DAY: u8 = 32;
 pub const SKY_LIGHT_NIGHT: u8 = 8;
+/// Sky light interpolates linearly across the 30 in-game minutes (1800
+/// ticks) centered on dawn/dusk (§9/§10).
+pub const SKY_LIGHT_RAMP_TICKS: u32 = 1800;
 /// BFS attenuation per step entering a non-solid / solid tile.
 pub const LIGHT_ATTEN_AIR: u8 = 2;
 pub const LIGHT_ATTEN_SOLID: u8 = 6;

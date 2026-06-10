@@ -110,24 +110,30 @@ impl WsClient {
     /// Drains every message received since the last call — call once per
     /// frame. Undecodable frames are counted in `bad_frames` and skipped.
     pub fn drain(&mut self) -> Vec<ServerMessage> {
-        let mut out = Vec::new();
         #[cfg(target_arch = "wasm32")]
-        loop {
-            let len = unsafe { quad_ws_next_len() };
-            if len < 0 {
-                break;
+        {
+            let mut out = Vec::new();
+            loop {
+                let len = unsafe { quad_ws_next_len() };
+                if len < 0 {
+                    break;
+                }
+                let mut buf = vec![0u8; len as usize];
+                let got = unsafe { quad_ws_recv(buf.as_mut_ptr(), buf.len()) };
+                if got < 0 {
+                    break;
+                }
+                buf.truncate(got as usize);
+                match protocol::decode::<ServerMessage>(&buf) {
+                    Some(msg) => out.push(msg),
+                    None => self.bad_frames = self.bad_frames.wrapping_add(1),
+                }
             }
-            let mut buf = vec![0u8; len as usize];
-            let got = unsafe { quad_ws_recv(buf.as_mut_ptr(), buf.len()) };
-            if got < 0 {
-                break;
-            }
-            buf.truncate(got as usize);
-            match protocol::decode::<ServerMessage>(&buf) {
-                Some(msg) => out.push(msg),
-                None => self.bad_frames = self.bad_frames.wrapping_add(1),
-            }
+            out
         }
-        out
+        // The native stub never receives (`mut out` here would trip the
+        // native client clippy lane's unused_mut).
+        #[cfg(not(target_arch = "wasm32"))]
+        Vec::new()
     }
 }

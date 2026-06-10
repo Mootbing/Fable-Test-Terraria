@@ -200,7 +200,8 @@ impl Hud {
         shadow_text(&self.clock_text, 12.0, 48.0, 22.0, TEXT_COLOR);
     }
 
-    /// F3 overlay: fps, position, chunk count, bad frames.
+    /// F3 overlay: fps, position, chunk count, bad frames, light timings.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_debug(
         &mut self,
         now: f64,
@@ -208,6 +209,8 @@ impl Hud {
         vel: (f32, f32),
         chunks: usize,
         bad_frames: u32,
+        light_ms: f64,
+        light_recomputes: u64,
     ) {
         if now - self.debug_at >= DEBUG_REFRESH_SECS {
             self.debug_at = now;
@@ -219,6 +222,9 @@ impl Hud {
                 .push(format!("vel: ({:.2}, {:.2}) t/s", vel.0, vel.1));
             self.debug_lines.push(format!("chunks: {chunks}"));
             self.debug_lines.push(format!("bad frames: {bad_frames}"));
+            self.debug_lines.push(format!(
+                "light: {light_ms:.2} ms last recompute ({light_recomputes} total)"
+            ));
         }
         for (i, line) in self.debug_lines.iter().enumerate() {
             shadow_text(line, 12.0, 78.0 + i as f32 * 20.0, 18.0, TEXT_COLOR);
