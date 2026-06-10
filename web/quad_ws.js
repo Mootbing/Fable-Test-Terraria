@@ -52,6 +52,17 @@
             new Uint8Array(wasm_memory.buffer, ptr, n).set(msg.subarray(0, n));
             return n;
         };
+
+        // Derive the game-server ws URL from the page location (wss on https
+        // pages, same host, path /ws) and write it into (ptr, cap).
+        // Returns bytes written, or -1 if it doesn't fit.
+        importObject.env.quad_ws_default_url = function (ptr, cap) {
+            const proto = location.protocol === "https:" ? "wss://" : "ws://";
+            const bytes = new TextEncoder().encode(proto + location.host + "/ws");
+            if (bytes.length > cap) return -1;
+            new Uint8Array(wasm_memory.buffer, ptr, bytes.length).set(bytes);
+            return bytes.length;
+        };
     }
 
     miniquad_add_plugin({ register_plugin, version: 1, name: "quad_ws" });
