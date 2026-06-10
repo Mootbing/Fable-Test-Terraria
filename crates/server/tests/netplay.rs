@@ -273,9 +273,15 @@ async fn http_get(port: u16, path: &str) -> String {
         .await
         .expect("tcp connect");
     let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.expect("send request");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("send request");
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.expect("read response");
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
     let text = String::from_utf8(response).expect("utf8 response");
     let (_, body) = text.split_once("\r\n\r\n").expect("response has a body");
     body.to_string()

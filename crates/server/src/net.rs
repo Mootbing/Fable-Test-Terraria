@@ -84,9 +84,7 @@ async fn session(mut socket: WebSocket, sim_tx: mpsc::Sender<SimCommand>) {
     };
     pump(socket, &sim_tx, player_id, outbound_rx).await;
     // Idempotent: the sim ignores ids it already removed (kicks).
-    let _ = sim_tx
-        .send(SimCommand::Disconnect { player_id })
-        .await;
+    let _ = sim_tx.send(SimCommand::Disconnect { player_id }).await;
 }
 
 /// Reads `Hello`, gates `PROTOCOL_VERSION` here, and delegates the stateful

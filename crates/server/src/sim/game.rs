@@ -341,7 +341,8 @@ impl Sim {
         }
 
         self.players.insert(id, player);
-        self.player_count.store(self.players.len(), Ordering::Relaxed);
+        self.player_count
+            .store(self.players.len(), Ordering::Relaxed);
         self.update_player_chunks(id);
         let _ = reply.send(Ok(id));
         tracing::info!(player = id, name = %name, "player joined");
@@ -363,14 +364,18 @@ impl Sim {
                 inventory: p.inventory,
             },
         );
-        self.player_count.store(self.players.len(), Ordering::Relaxed);
+        self.player_count
+            .store(self.players.len(), Ordering::Relaxed);
         self.broadcast(&ServerMessage::PlayerLeft { id });
     }
 
     fn flush_kicks(&mut self) {
         while let Some(id) = self.pending_kicks.pop() {
             if self.players.contains_key(&id) {
-                tracing::warn!(player = id, "dropping session: outbound queue full or closed");
+                tracing::warn!(
+                    player = id,
+                    "dropping session: outbound queue full or closed"
+                );
                 self.remove_player(id);
             }
         }
@@ -637,7 +642,11 @@ pub async fn run(mut sim: Sim, mut rx: mpsc::Receiver<SimCommand>) {
         if behind > LAG_WARN_THRESHOLD
             && last_lag_warn.is_none_or(|t| t.elapsed() >= LAG_WARN_INTERVAL)
         {
-            tracing::warn!(behind_ms = behind.as_millis() as u64, tick = ticks, "sim ticks falling behind; bursting to catch up");
+            tracing::warn!(
+                behind_ms = behind.as_millis() as u64,
+                tick = ticks,
+                "sim ticks falling behind; bursting to catch up"
+            );
             last_lag_warn = Some(Instant::now());
         }
         ticks += 1;
@@ -703,12 +712,7 @@ fn player_chunk(world: &World, point: (f32, f32)) -> (u32, u32) {
 }
 
 /// The chunk-coordinate window `center ± (rx, ry)`, clamped to the grid.
-fn chunk_window(
-    world: &World,
-    center: (u32, u32),
-    rx: u32,
-    ry: u32,
-) -> (Range<u32>, Range<u32>) {
+fn chunk_window(world: &World, center: (u32, u32), rx: u32, ry: u32) -> (Range<u32>, Range<u32>) {
     (
         center.0.saturating_sub(rx)..(center.0 + rx + 1).min(world.chunks_x()),
         center.1.saturating_sub(ry)..(center.1 + ry + 1).min(world.chunks_y()),
@@ -854,9 +858,9 @@ mod tests {
         let (re_id, mut rx) = join(&mut sim, "alice", Some(token));
         assert_eq!(re_id, id, "identity reclaimed");
         let msgs = drain(&mut rx);
-        let moved_back = msgs.iter().any(|m| {
-            matches!(m, ServerMessage::Welcome { .. })
-        });
+        let moved_back = msgs
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Welcome { .. }));
         assert!(moved_back);
         assert_eq!(sim.players[&re_id].pos, (165.0, 95.0));
     }
@@ -983,7 +987,9 @@ mod tests {
         // Whitespace-only chat is dropped.
         sim.handle(SimCommand::Message {
             player_id: a,
-            msg: ClientMessage::Chat { text: "  \n ".into() },
+            msg: ClientMessage::Chat {
+                text: "  \n ".into(),
+            },
         });
         assert!(drain(&mut rx_b).is_empty());
     }
