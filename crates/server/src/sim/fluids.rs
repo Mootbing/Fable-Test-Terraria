@@ -152,8 +152,18 @@ impl FluidSim {
                     LiquidKind::Lava => ((nx, ny), (x, y)),
                 };
                 obsidianize(world, (wx, wy), (lx, ly), changed);
-                self.mark(wx, wy);
-                self.mark(lx, ly);
+                // Both contact cells changed, so wake *their* full
+                // neighborhoods — the caller only re-marks around the
+                // visited cell, which leaves e.g. the water cell's other
+                // neighbors frozen mid-flow when we were visiting the lava
+                // cell (settle() would return a non-fixed-point).
+                for (cx, cy) in [(wx, wy), (lx, ly)] {
+                    self.mark(cx, cy);
+                    self.mark(cx.wrapping_sub(1), cy);
+                    self.mark(cx + 1, cy);
+                    self.mark(cx, cy.wrapping_sub(1));
+                    self.mark(cx, cy + 1);
+                }
                 return true;
             }
         }
@@ -257,6 +267,7 @@ pub fn settle(world: &mut World) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferraria_shared::rng::Pcg32;
     use ferraria_shared::tiles::Tile;
 
     fn boxed_world(w: u32, h: u32) -> World {
@@ -380,6 +391,46 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn settle_reaches_a_fixed_point_on_random_terrain() {
+        // Regression: the §3.2 contact branch used to wake only the two
+        // contact cells plus the *visited* cell's neighborhood. When the
+        // visited cell was the lava cell, the water cell's other neighbors
+        // never re-marked — e.g. a stable 2|1 water pair over lava froze in
+        // a non-equilibrium state after the obsidian conversion drained the
+        // level-1 cell. settle() must return a true fixed point.
+        for seed in 0..30u64 {
+            let mut w = boxed_world(48, 48);
+            let mut rng = Pcg32::new(0xf00d ^ seed);
+            for y in 1..47 {
+                for x in 1..47 {
+                    if rng.chance(0.35) {
+                        w.set_tile(x, y, Tile::of(TileId::Stone));
+                    } else {
+                        match rng.gen_range_u32(0..10) {
+                            0..=2 => {
+                                let lvl = rng.gen_range_u32(1..9) as u8;
+                                put(&mut w, x, y, LiquidKind::Water, lvl);
+                            }
+                            3 => {
+                                let lvl = rng.gen_range_u32(1..9) as u8;
+                                put(&mut w, x, y, LiquidKind::Lava, lvl);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let rounds = settle(&mut w);
+            assert!(rounds < MAX_SETTLE_ROUNDS, "seed {seed}: never terminated");
+            assert_no_contact(&w);
+            // Idempotency: a second settle() must change nothing at all.
+            let snapshot = w.tiles.clone();
+            settle(&mut w);
+            assert_eq!(snapshot, w.tiles, "seed {seed}: settle not a fixed point");
         }
     }
 
