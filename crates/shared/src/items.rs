@@ -543,7 +543,14 @@ pub const STARTING_KIT: [InvSlot; 4] = [
 
 /// Inventory layout (§8): hotbar 10 + backpack 40 + armor 3 + accessory 3 +
 /// trash 1 = 57 slots. Index helpers for the flat slot array.
+///
+/// Fixed indices: hotbar `0..10`, backpack `10..50`, armor `50..53` (in
+/// [`ARMOR_SLOT_ORDER`]: 50 = Head, 51 = Chest, 52 = Legs), accessories
+/// `53..56`, trash `56`. The slot-op engine
+/// ([`crate::inventory_ops`]) enforces what each region accepts.
 pub mod inventory {
+    use super::ArmorSlot;
+
     pub const HOTBAR: usize = 10;
     pub const BACKPACK: usize = 40;
     pub const ARMOR: usize = 3;
@@ -554,6 +561,15 @@ pub mod inventory {
     pub const ACCESSORY_START: usize = ARMOR_START + ARMOR;
     pub const TRASH: usize = ACCESSORY_START + ACCESSORY;
     pub const TOTAL: usize = TRASH + 1;
+
+    /// Which armor piece each of the three armor slots holds, by offset
+    /// from [`ARMOR_START`].
+    pub const ARMOR_SLOT_ORDER: [ArmorSlot; ARMOR] =
+        [ArmorSlot::Head, ArmorSlot::Chest, ArmorSlot::Legs];
+
+    /// The slot range crafting consumes from and outputs into (§4.4):
+    /// hotbar + backpack only — never armor, accessories, or trash.
+    pub const CRAFTING_SLOTS: std::ops::Range<usize> = 0..ARMOR_START;
 }
 
 /// Adds `count` of `item` into the carry slots (hotbar then backpack; never

@@ -102,6 +102,38 @@ pub fn fall_damage(tiles_fallen: f32) -> u32 {
     }
 }
 
+/// Physics-affecting equipment modifiers (§4.3 accessories), produced from a
+/// player's worn loadout by [`crate::loadout::physics_mods`]. Both the server
+/// and the predicting client derive this from the same inventory through the
+/// same pure function, so they can never disagree.
+///
+/// `Default` is "no accessories": multiplier 1, no extra jumps, fall damage
+/// applies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsMods {
+    /// Max-run-speed multiplier (Swift Boots: ×1.25).
+    pub speed_mult: f32,
+    /// Mid-air jumps available per airborne stretch (Gust Jar: 1).
+    pub extra_air_jumps: u8,
+    /// Lucky Charm: landing never deals fall damage.
+    pub no_fall_damage: bool,
+}
+
+impl Default for PhysicsMods {
+    fn default() -> Self {
+        PhysicsMods::NONE
+    }
+}
+
+impl PhysicsMods {
+    /// Bare loadout: no speed boost, no double jump, fall damage applies.
+    pub const NONE: PhysicsMods = PhysicsMods {
+        speed_mult: 1.0,
+        extra_air_jumps: 0,
+        no_fall_damage: false,
+    };
+}
+
 /// Mutable physics state for one player.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PlayerPhysics {
@@ -119,7 +151,12 @@ pub struct PlayerPhysics {
     /// Tiles fallen since last grounded/swimming, for fall damage.
     pub fall_distance: f32,
     /// Run-speed multiplier (1.0 base; Swift Boots set 1.25).
+    ///
+    /// Superseded by [`PhysicsMods::speed_mult`] (the multipliers stack
+    /// multiplicatively; loadout code uses mods and leaves this at 1.0).
     pub run_speed_mult: f32,
+    /// Mid-air jumps spent since last grounded/swimming (Gust Jar, §4.3).
+    pub air_jumps_used: u8,
 }
 
 impl PlayerPhysics {
@@ -134,6 +171,7 @@ impl PlayerPhysics {
             drop_through: 0.0,
             fall_distance: 0.0,
             run_speed_mult: 1.0,
+            air_jumps_used: 0,
         }
     }
 
@@ -187,6 +225,18 @@ pub struct StepResult {
     pub swimming: bool,
     pub in_cobweb: bool,
     pub hit_ceiling: bool,
+}
+
+/// Hold-to-rise window for a Gust Jar mid-air jump, derived so its apex is
+/// exactly [`crate::items::GUST_JAR_SECOND_JUMP_MULT`] (75%) of a full-hold
+/// ground jump's. A full jump rises `J·T` during the hold plus the ballistic
+/// `J²/2g` after it; solving `J·T' + J²/2g = mult · (J·T + J²/2g)` for the
+/// air-jump hold `T'` is linear:
+pub fn air_jump_hold_secs() -> f32 {
+    let ballistic = JUMP_SPEED * JUMP_SPEED / (2.0 * GRAVITY);
+    let full_height = JUMP_SPEED * JUMP_HOLD_SECS + ballistic;
+    let target = full_height * crate::items::GUST_JAR_SECOND_JUMP_MULT;
+    ((target - ballistic) / JUMP_SPEED).max(0.0)
 }
 
 #[inline]
@@ -350,17 +400,31 @@ fn try_step_up(world: &World, pos: (f32, f32), size: (f32, f32), dx: f32) -> Opt
     Some((nx, lifted_y))
 }
 
-/// Advances one player by `dt` seconds against the tile grid.
-///
-/// Handles: run accel/friction, hold-jump variable height, gravity/terminal
-/// velocity, axis-separated AABB collision, 1-tile auto-step, platform
-/// semi-solidity with Down+Jump drop, liquid physics (§3), cobweb slowdown,
-/// and fall-distance tracking.
+/// [`step_player_with_mods`] with no equipment modifiers — the original
+/// signature, kept so existing callers (and call sites that predate the
+/// loadout system) stay source-compatible.
 pub fn step_player(
     world: &World,
     p: &mut PlayerPhysics,
     input: PlayerInput,
     dt: f32,
+) -> StepResult {
+    step_player_with_mods(world, p, input, dt, PhysicsMods::NONE)
+}
+
+/// Advances one player by `dt` seconds against the tile grid.
+///
+/// Handles: run accel/friction, hold-jump variable height, gravity/terminal
+/// velocity, axis-separated AABB collision, 1-tile auto-step, platform
+/// semi-solidity with Down+Jump drop, liquid physics (§3), cobweb slowdown,
+/// fall-distance tracking, and equipment modifiers ([`PhysicsMods`]: Swift
+/// Boots run speed, Gust Jar mid-air jump).
+pub fn step_player_with_mods(
+    world: &World,
+    p: &mut PlayerPhysics,
+    input: PlayerInput,
+    dt: f32,
+    mods: PhysicsMods,
 ) -> StepResult {
     let size = (PLAYER_WIDTH, PLAYER_HEIGHT);
     let mut out = StepResult::default();
@@ -390,6 +454,15 @@ pub fn step_player(
         p.vel.1 = -JUMP_SPEED;
         p.jump_hold_left = JUMP_HOLD_SECS;
         p.on_ground = false;
+    } else if jump_pressed && !p.on_ground && p.air_jumps_used < mods.extra_air_jumps {
+        // Gust Jar mid-air jump (§4.3, "second jump = 75% height"): same
+        // impulse, shorter hold window — see [`air_jump_hold_secs`]. A
+        // mid-air jump also negates the fall so far (§8 fall-damage
+        // mitigations).
+        p.air_jumps_used += 1;
+        p.vel.1 = -JUMP_SPEED;
+        p.jump_hold_left = air_jump_hold_secs();
+        p.fall_distance = 0.0;
     }
     if !input.jump {
         p.jump_hold_left = 0.0;
@@ -410,7 +483,10 @@ pub fn step_player(
 
     // Horizontal acceleration / friction.
     let dir = (input.right as i8 - input.left as i8) as f32;
-    let max_run = RUN_MAX_SPEED * p.run_speed_mult * if swimming { LIQUID_SPEED_MULT } else { 1.0 };
+    let max_run = RUN_MAX_SPEED
+        * p.run_speed_mult
+        * mods.speed_mult
+        * if swimming { LIQUID_SPEED_MULT } else { 1.0 };
     if dir != 0.0 {
         p.vel.0 += RUN_ACCEL * dir * dt;
         p.vel.0 = p.vel.0.clamp(-max_run, max_run);
@@ -467,6 +543,7 @@ pub fn step_player(
         // Deep liquid breaks falls (§8); shallow puddles don't reach the
         // body center and so still hurt.
         p.fall_distance = 0.0;
+        p.air_jumps_used = 0;
     } else if was_falling {
         p.fall_distance += fell;
     }
@@ -478,6 +555,7 @@ pub fn step_player(
             out.fall_distance = p.fall_distance;
         }
         p.fall_distance = 0.0;
+        p.air_jumps_used = 0;
         p.vel.1 = 0.0;
     }
     if hit_ceiling {
@@ -969,6 +1047,113 @@ mod tests {
             "landed on the platform, bottom at {}",
             pos.1 + h
         );
+    }
+
+    #[test]
+    fn swift_boots_mod_raises_max_run_speed() {
+        let world = flat_world();
+        let mods = PhysicsMods {
+            speed_mult: crate::items::SWIFT_BOOTS_SPEED_MULT,
+            ..PhysicsMods::NONE
+        };
+        let mut p = PlayerPhysics::from_feet(5.0, 10.0);
+        settle(&world, &mut p);
+        for _ in 0..120 {
+            step_player_with_mods(&world, &mut p, RIGHT, DT, mods);
+        }
+        assert_eq!(p.vel.0, RUN_MAX_SPEED * crate::items::SWIFT_BOOTS_SPEED_MULT);
+        // And without mods the plain cap still holds.
+        let mut q = PlayerPhysics::from_feet(5.0, 10.0);
+        settle(&world, &mut q);
+        for _ in 0..120 {
+            step_player(&world, &mut q, RIGHT, DT);
+        }
+        assert_eq!(q.vel.0, RUN_MAX_SPEED);
+    }
+
+    /// A flat world with lots of headroom (floor top y = 30) so stacked
+    /// jumps never reach the solid world border above row 0.
+    fn tall_flat_world() -> World {
+        let mut rows = vec![".".repeat(60); 30];
+        rows.push("#".repeat(60));
+        rows.push("#".repeat(60));
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        world_from_ascii(&refs)
+    }
+
+    #[test]
+    fn gust_jar_mod_allows_one_air_jump_at_75_percent_height() {
+        let world = tall_flat_world();
+        let mods = PhysicsMods {
+            extra_air_jumps: 1,
+            ..PhysicsMods::NONE
+        };
+        // Reference: full-hold ground jump apex.
+        let mut p = PlayerPhysics::from_feet(30.0, 30.0);
+        settle(&world, &mut p);
+        let start = p.feet_y();
+        let mut full_apex = start;
+        for _ in 0..120 {
+            step_player(&world, &mut p, JUMP, DT);
+            full_apex = full_apex.min(p.feet_y());
+        }
+        let full_rise = start - full_apex;
+
+        // Air jump from the ground-jump apex: release at apex, re-press.
+        let mut p = PlayerPhysics::from_feet(30.0, 30.0);
+        settle(&world, &mut p);
+        while p.vel.1 < 0.0 || p.on_ground {
+            step_player_with_mods(&world, &mut p, JUMP, DT, mods);
+        }
+        let apex = p.feet_y();
+        step_player_with_mods(&world, &mut p, PlayerInput::default(), DT, mods); // release
+        let mut air_apex = p.feet_y();
+        step_player_with_mods(&world, &mut p, JUMP, DT, mods); // re-press
+        assert_eq!(p.air_jumps_used, 1, "air jump consumed");
+        for _ in 0..150 {
+            step_player_with_mods(&world, &mut p, JUMP, DT, mods);
+            air_apex = air_apex.min(p.feet_y());
+        }
+        let air_rise = apex - air_apex;
+        let ratio = air_rise / full_rise;
+        assert!(
+            (0.70..0.80).contains(&ratio),
+            "air jump rose {air_rise} vs full {full_rise} (ratio {ratio})"
+        );
+
+        // Without the mod, the same re-press does nothing mid-air.
+        let mut q = PlayerPhysics::from_feet(30.0, 30.0);
+        settle(&world, &mut q);
+        while q.vel.1 < 0.0 || q.on_ground {
+            step_player(&world, &mut q, JUMP, DT);
+        }
+        step_player(&world, &mut q, PlayerInput::default(), DT);
+        let vy_before = q.vel.1;
+        step_player(&world, &mut q, JUMP, DT);
+        assert!(q.vel.1 >= vy_before, "no air jump without the mod");
+
+        // Landing resets the allowance.
+        for _ in 0..200 {
+            step_player_with_mods(&world, &mut p, PlayerInput::default(), DT, mods);
+        }
+        assert!(p.on_ground);
+        assert_eq!(p.air_jumps_used, 0);
+    }
+
+    #[test]
+    fn air_jump_negates_accumulated_fall_distance() {
+        let world = World::new(10, 300); // tall free fall
+        let mods = PhysicsMods {
+            extra_air_jumps: 1,
+            ..PhysicsMods::NONE
+        };
+        let mut p = PlayerPhysics::new((4.0, 0.0));
+        for _ in 0..120 {
+            step_player_with_mods(&world, &mut p, PlayerInput::default(), DT, mods);
+        }
+        assert!(p.fall_distance > SAFE_FALL_TILES, "fell far");
+        step_player_with_mods(&world, &mut p, JUMP, DT, mods);
+        assert_eq!(p.fall_distance, 0.0, "mid-air jump resets the fall");
     }
 
     #[test]

@@ -258,6 +258,13 @@ pub enum ClientMessage {
     },
     /// Get out of bed (also implied by moving/taking damage, server-side).
     WakeUp,
+    /// Move half of `from`'s stack (rounded up) onto `to` — the RMB
+    /// half-pickup. Same validation as [`ClientMessage::MoveSlot`]; `to`
+    /// must be empty or hold the same item.
+    SplitSlot {
+        from: u8,
+        to: u8,
+    },
 }
 
 /// Server → client. **Append-only** (see module docs).
@@ -438,6 +445,13 @@ pub enum ServerMessage {
     TilesChanged {
         changes: Vec<(u32, u32, Tile)>,
     },
+    /// Single-slot delta of the chest the receiving player has open (the
+    /// chest analog of [`ServerMessage::SlotChanged`]). Only the opener
+    /// receives these — a chest is locked to one player while open (§11).
+    ChestSlotChanged {
+        idx: u8,
+        stack: Option<InvSlot>,
+    },
 }
 
 /// Encodes a message into a postcard frame. Infallible for these types
@@ -519,6 +533,11 @@ mod tests {
         });
         roundtrip_client(ClientMessage::Sleep { x: 2105, y: 277 });
         roundtrip_client(ClientMessage::WakeUp);
+        roundtrip_client(ClientMessage::MoveSlot { from: 0, to: 56 });
+        roundtrip_client(ClientMessage::SplitSlot { from: 9, to: 49 });
+        roundtrip_client(ClientMessage::DropItem { slot: 12, count: 999 });
+        roundtrip_client(ClientMessage::OpenChest { x: 2100, y: 950 });
+        roundtrip_client(ClientMessage::CloseChest);
     }
 
     #[test]
@@ -646,6 +665,28 @@ mod tests {
                     },
                 ),
             ],
+        });
+        roundtrip_server(ServerMessage::SlotChanged {
+            idx: 52,
+            stack: Some(InvSlot::new(ItemId::GoldGreaves, 1)),
+        });
+        roundtrip_server(ServerMessage::SlotChanged {
+            idx: 0,
+            stack: None,
+        });
+        roundtrip_server(ServerMessage::ChestContents {
+            x: 17,
+            y: 902,
+            slots: vec![Some(InvSlot::new(ItemId::SwiftBoots, 1)), None],
+        });
+        roundtrip_server(ServerMessage::ChestDenied);
+        roundtrip_server(ServerMessage::ChestSlotChanged {
+            idx: 39,
+            stack: Some(InvSlot::new(ItemId::GoldBar, 8)),
+        });
+        roundtrip_server(ServerMessage::ChestSlotChanged {
+            idx: 0,
+            stack: None,
         });
     }
 

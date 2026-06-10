@@ -8,7 +8,9 @@
 //! DESIGN.md; don't inline them elsewhere.
 
 pub mod crafting;
+pub mod inventory_ops;
 pub mod items;
+pub mod loadout;
 mod macros;
 pub mod physics;
 pub mod protocol;
