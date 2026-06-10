@@ -612,6 +612,128 @@ pub fn step_item_drop(world: &World, pos: &mut (f32, f32), vel: &mut (f32, f32),
     hit_floor
 }
 
+/// What one enemy/projectile body step observed (the enemy AI's sensory
+/// inputs: ledges, walls, liquids).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BodyStep {
+    pub on_ground: bool,
+    /// The horizontal sweep hit a wall this step (after any auto-step).
+    pub blocked_x: bool,
+    pub hit_ceiling: bool,
+    /// Body center is submerged in this liquid, if any.
+    pub submerged: Option<LiquidKind>,
+}
+
+/// Advances a grounded enemy body (slimes, fighters) by `dt`: gravity under
+/// the §0 terminal cap (×§3 liquid multipliers while submerged),
+/// axis-separated AABB collision against solids + platform tops, cobweb
+/// clamping (§2), and — when `auto_step` — the same 1-tile ledge step
+/// players get (§5.2 Fighter AI). Knockback writes `vel` directly; this
+/// only integrates.
+pub fn step_enemy_body(
+    world: &World,
+    pos: &mut (f32, f32),
+    vel: &mut (f32, f32),
+    size: (f32, f32),
+    dt: f32,
+    auto_step: bool,
+) -> BodyStep {
+    let mut out = BodyStep {
+        submerged: liquid_at_center(world, *pos, size),
+        ..BodyStep::default()
+    };
+    let in_liquid = out.submerged.is_some();
+    let g_mult = if in_liquid { LIQUID_GRAVITY_MULT } else { 1.0 };
+    let t_mult = if in_liquid { LIQUID_TERMINAL_MULT } else { 1.0 };
+    vel.1 += GRAVITY * g_mult * dt;
+    let terminal = TERMINAL_VELOCITY * t_mult;
+    if vel.1 > terminal {
+        vel.1 = terminal;
+    }
+    if aabb_overlaps_tile(world, *pos, size, TileId::Cobweb) {
+        vel.0 = vel.0.clamp(-COBWEB_MAX_SPEED, COBWEB_MAX_SPEED);
+        vel.1 = vel.1.clamp(-COBWEB_MAX_SPEED, COBWEB_MAX_SPEED);
+    }
+
+    let dx = vel.0 * dt;
+    if dx != 0.0 {
+        let (nx, blocked) = sweep_x(world, *pos, size, dx);
+        let mut resolved = false;
+        if blocked && auto_step && vel.1 >= 0.0 {
+            if let Some(stepped) = try_step_up(world, *pos, size, dx) {
+                *pos = stepped;
+                resolved = true;
+            }
+        }
+        if !resolved {
+            pos.0 = nx;
+            out.blocked_x = blocked;
+        }
+    }
+
+    let dy = vel.1 * dt;
+    let (ny, hit_floor, hit_ceiling) = sweep_y(world, *pos, size, dy, false);
+    pos.1 = ny;
+    if hit_floor {
+        vel.1 = 0.0;
+        out.on_ground = true;
+    }
+    if hit_ceiling {
+        vel.1 = 0.0;
+        out.hit_ceiling = true;
+    }
+    out
+}
+
+/// Advances a flying body (fliers, projectiles) by `dt`: straight
+/// axis-separated AABB collision against solids, no gravity (callers add
+/// their own, e.g. arrows at ×0.35). Blocked axes zero their velocity
+/// component unless the caller restores it (the Demon Eye reflects instead).
+pub fn step_flier_body(
+    world: &World,
+    pos: &mut (f32, f32),
+    vel: &mut (f32, f32),
+    size: (f32, f32),
+    dt: f32,
+) -> BodyStep {
+    let mut out = BodyStep {
+        submerged: liquid_at_center(world, *pos, size),
+        ..BodyStep::default()
+    };
+    let dx = vel.0 * dt;
+    if dx != 0.0 {
+        let (nx, blocked) = sweep_x(world, *pos, size, dx);
+        pos.0 = nx;
+        out.blocked_x = blocked;
+    }
+    let dy = vel.1 * dt;
+    if dy != 0.0 {
+        // Fliers pass over platforms (they only collide with solids).
+        let (ny, hit_floor, hit_ceiling) = sweep_y(world, *pos, size, dy, true);
+        pos.1 = ny;
+        out.on_ground = hit_floor;
+        out.hit_ceiling = hit_ceiling;
+    }
+    out
+}
+
+/// Whether a straight line between two points crosses any solid tile —
+/// the §5.2 line-of-sight test (Ash Demon volleys). Samples the segment at
+/// quarter-tile steps; good enough for AI.
+pub fn line_of_sight(world: &World, from: (f32, f32), to: (f32, f32)) -> bool {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = (dist * 4.0).ceil().max(1.0) as u32;
+    for i in 0..=steps {
+        let f = i as f32 / steps as f32;
+        let (x, y) = (from.0 + dx * f, from.1 + dy * f);
+        if world.is_solid(x.floor() as i32, y.floor() as i32) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Advances one falling-tile entity (§2 tile 4: unsupported sand) by `dt`
 /// seconds: a straight vertical fall under gravity capped at the §0 terminal
 /// velocity (×§3 multipliers while submerged), colliding with **solid** tiles
@@ -1157,6 +1279,108 @@ mod tests {
         assert!(p.fall_distance > SAFE_FALL_TILES, "fell far");
         step_player_with_mods(&world, &mut p, JUMP, DT, mods);
         assert_eq!(p.fall_distance, 0.0, "mid-air jump resets the fall");
+    }
+
+    #[test]
+    fn enemy_body_walks_steps_and_blocks() {
+        // Floor top y=10 for x<20, y=9 after (1-tile ledge), wall at x=30.
+        let mut rows: Vec<String> = (0..12)
+            .map(|y| {
+                (0..40)
+                    .map(|x| {
+                        let floor_top = if x < 20 { 10 } else { 9 };
+                        if y >= floor_top || (x == 30 && y >= 6) {
+                            '#'
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        rows.push("#".repeat(40));
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let world = world_from_ascii(&refs);
+        let size = (1.25, 2.75);
+        let mut pos = (15.0, 10.0 - size.1 - COLLISION_EPS);
+        let mut vel = (0.0f32, 0.0f32);
+        let mut blocked = false;
+        for _ in 0..600 {
+            vel.0 = 3.2;
+            // (Like the player, the step engages one tick after first
+            // contact — the body must be flush against the ledge.)
+            blocked |= step_enemy_body(&world, &mut pos, &mut vel, size, DT, true).blocked_x;
+        }
+        assert!(blocked, "reached and reported the wall");
+        assert!(
+            (pos.0 + size.0 - 30.0).abs() < 0.05,
+            "walked to the wall (edge at {})",
+            pos.0 + size.0
+        );
+        assert!((pos.1 + size.1 - 9.0).abs() < 0.05, "auto-stepped the ledge");
+
+        // Without auto-step the same body is blocked at the ledge instead.
+        let mut pos = (15.0, 10.0 - size.1 - COLLISION_EPS);
+        let mut vel = (3.2f32, 0.0f32);
+        let mut blocked_at = None;
+        for _ in 0..600 {
+            vel.0 = 3.2;
+            let r = step_enemy_body(&world, &mut pos, &mut vel, size, DT, false);
+            if r.blocked_x {
+                blocked_at = Some(pos.0 + size.0);
+                break;
+            }
+        }
+        assert!(
+            blocked_at.is_some_and(|x| (x - 20.0).abs() < 0.05),
+            "no auto-step: blocked at the ledge ({blocked_at:?})"
+        );
+    }
+
+    #[test]
+    fn flier_body_reports_collisions_without_gravity() {
+        let world = world_from_ascii(&[
+            "##########",
+            "..........",
+            "..........",
+            "..........",
+            "##########",
+        ]);
+        let size = (1.0, 1.0);
+        let mut pos = (4.0, 2.0);
+        let mut vel = (0.0, -10.0);
+        let mut hit_ceiling = false;
+        for _ in 0..60 {
+            let r = step_flier_body(&world, &mut pos, &mut vel, size, DT);
+            hit_ceiling |= r.hit_ceiling;
+        }
+        assert!(hit_ceiling);
+        assert!(pos.1 >= 1.0 - 0.01, "did not clip into the ceiling");
+        // No gravity was applied: vy is whatever the caller left there.
+        assert_eq!(vel.0, 0.0);
+
+        let mut pos = (4.0, 2.0);
+        let mut vel = (12.0, 0.0);
+        let mut blocked = false;
+        for _ in 0..120 {
+            let r = step_flier_body(&world, &mut pos, &mut vel, size, DT);
+            blocked |= r.blocked_x;
+        }
+        assert!(blocked, "hit the right border wall");
+    }
+
+    #[test]
+    fn line_of_sight_blocked_by_solids() {
+        let world = world_from_ascii(&[
+            "..........",
+            "....#.....",
+            "....#.....",
+            "....#.....",
+            "##########",
+        ]);
+        assert!(!line_of_sight(&world, (1.5, 2.5), (8.5, 2.5)), "wall blocks");
+        assert!(line_of_sight(&world, (1.5, 0.5), (8.5, 0.5)), "over the top");
+        assert!(line_of_sight(&world, (1.5, 2.5), (3.5, 2.5)), "same side");
     }
 
     #[test]

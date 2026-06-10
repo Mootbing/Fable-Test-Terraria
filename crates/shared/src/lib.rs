@@ -8,6 +8,7 @@
 //! DESIGN.md; don't inline them elsewhere.
 
 pub mod crafting;
+pub mod enemies;
 pub mod inventory_ops;
 pub mod items;
 pub mod loadout;
