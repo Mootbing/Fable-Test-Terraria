@@ -17,7 +17,8 @@ use ferraria_shared::protocol::{EntityKind, EntityState};
 use ferraria_shared::tiles::TileId;
 use ferraria_shared::TILE_SIZE;
 
-use crate::render::item_color;
+use crate::light::LightEngine;
+use crate::render::{item_color, lit_color, tile_color};
 use crate::ui::shadow_text;
 
 /// On snapshot gaps, extrapolate along the last velocity at most this long
@@ -155,8 +156,9 @@ impl Entities {
     }
 
     /// Draws all item drops (bob + spin), falling-sand tiles, and the name
-    /// tooltip of the drop under the mouse, if any.
-    pub fn draw(&mut self, render_t: f64, now: f64, cam_top_left: Vec2) {
+    /// tooltip of the drop under the mouse, if any. Sprites are tinted by
+    /// the light level at their cell, like tiles and players.
+    pub fn draw(&mut self, render_t: f64, now: f64, cam_top_left: Vec2, light: &LightEngine) {
         let (mouse_x, mouse_y) = mouse_position();
         let mut tooltip: Option<(String, f32, f32)> = None;
         let (w, h) = hitbox::ITEM_DROP;
@@ -164,12 +166,13 @@ impl Entities {
             // Falling sand (§2 tile 4) renders as the tile it is.
             if matches!(e.kind, Kind::Other(EntityKind::FallingSand)) {
                 let pos = e.sample(render_t);
+                let l = light.brightness_at(pos.0 + 0.5, pos.1 + 0.5);
                 draw_rectangle(
                     pos.0 * TILE_SIZE - cam_top_left.x,
                     pos.1 * TILE_SIZE - cam_top_left.y,
                     TILE_SIZE,
                     TILE_SIZE,
-                    crate::render::tile_color(TileId::Sand),
+                    lit_color(tile_color(TileId::Sand), l),
                 );
                 continue;
             }
@@ -188,6 +191,7 @@ impl Entities {
             {
                 continue;
             }
+            let l = light.brightness_at(pos.0 + w / 2.0, pos.1 + h / 2.0);
             draw_rectangle_ex(
                 cx,
                 cy,
@@ -196,7 +200,7 @@ impl Entities {
                 DrawRectangleParams {
                     offset: vec2(0.5, 0.5),
                     rotation: now as f32 * SPIN_HZ * std::f32::consts::TAU + phase,
-                    color: item_color(item),
+                    color: lit_color(item_color(item), l),
                 },
             );
             // Hover tooltip: generous half-tile radius around the sprite.

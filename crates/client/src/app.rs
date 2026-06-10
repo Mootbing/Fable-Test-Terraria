@@ -6,18 +6,20 @@ use std::collections::HashMap;
 
 use macroquad::prelude::*;
 
-use ferraria_shared::items::{inventory, InvSlot};
-use ferraria_shared::physics::PlayerInput;
+use ferraria_shared::items::{inventory, ArmorSlot, InvSlot, ItemId};
+use ferraria_shared::physics::{PlayerInput, PLAYER_HEIGHT, PLAYER_WIDTH};
 use ferraria_shared::protocol::{AuthToken, ClientMessage, ServerMessage};
+use ferraria_shared::tiles::{MINING_HELMET_LIGHT, PLAYER_GLOW};
 use ferraria_shared::world::{WorldFlags, DAY_TICKS};
 use ferraria_shared::{MAX_NAME_CHARS, PROTOCOL_VERSION, TICK_RATE, TILE_SIZE};
 
 use crate::entities::Entities;
 use crate::hotbar;
 use crate::interact::Interact;
+use crate::light::{self, DynamicSource, LightEngine};
 use crate::net::{WsClient, WsStatus};
 use crate::player::{OwnPlayer, RemotePlayer, Snapshot, CORRECTION_SNAP_TILES, INTERP_DELAY};
-use crate::render::{self, Camera, PlayerDraw};
+use crate::render::{self, Camera, PlayerDraw, QuadBatch};
 use crate::ui::{self, Chat, DisconnectedChoice, Hud};
 use crate::world_view::WorldView;
 
@@ -247,12 +249,25 @@ struct Session {
     camera: Camera,
     chat: Chat,
     hud: Hud,
-    /// Server-authoritative inventory mirror (flat §8 layout).
+    /// Server-authoritative inventory mirror (flat §8 layout). Also feeds
+    /// lighting: a Mining Helmet in the head armor slot is a light source.
     inventory: Vec<Option<InvSlot>>,
     /// Selected hotbar slot (0–9); the server learns via `SelectSlot`.
     selected: u8,
     interact: Interact,
     entities: Entities,
+    light: LightEngine,
+    /// Reusable buffers: per-vertex-colored quads (darkness overlay, sky,
+    /// vignette), this frame's dynamic light sources, the remote-player
+    /// snapshots sampled once per frame (lighting + drawing share them), and
+    /// the visible rect's corner-brightness grid for `draw_world`.
+    batch: QuadBatch,
+    sources: Vec<DynamicSource>,
+    remote_samples: Vec<(u32, Snapshot)>,
+    corners: Vec<f32>,
+    /// F3 stats: duration of the last light recompute and how many ran.
+    light_ms: f64,
+    light_recomputes: u64,
     /// World progress flags, mirrored for later UI (bosses defeated...).
     #[allow(dead_code)]
     flags: WorldFlags,
@@ -267,6 +282,7 @@ impl Session {
         camera.snap(vec2(center.0, center.1) * TILE_SIZE, world_px(&view));
         Session {
             ws,
+            light: LightEngine::new(welcome.world_width, welcome.world_height),
             view,
             own_id: welcome.player_id,
             token: welcome.token,
@@ -284,6 +300,12 @@ impl Session {
             selected: 0,
             interact: Interact::new(),
             entities: Entities::new(),
+            batch: QuadBatch::new(),
+            sources: Vec::new(),
+            remote_samples: Vec::new(),
+            corners: Vec::new(),
+            light_ms: 0.0,
+            light_recomputes: 0,
             flags: welcome.flags,
         }
     }
@@ -353,14 +375,48 @@ impl Session {
             );
         }
 
-        // 5. Draw.
-        clear_background(render::sky_color(self.clock.ticks()));
-        render::draw_world(&self.view, &self.camera);
+        // 5. Lighting. Sample remote players once (lighting and drawing
+        // share the snapshots), gather this frame's dynamic sources, and let
+        // the engine decide whether the visible region needs a recompute.
         let render_t = now - INTERP_DELAY;
-        self.interact.draw_cracks(now, tl);
-        self.entities.draw(render_t, now, tl);
-        for remote in self.remotes.values_mut() {
-            let s = remote.sample(render_t);
+        self.remote_samples.clear();
+        for (&id, remote) in self.remotes.iter_mut() {
+            self.remote_samples.push((id, remote.sample(render_t)));
+        }
+        // Stable order: dynamic sources are compared against last frame's to
+        // skip recomputes, which map iteration order must not defeat.
+        self.remote_samples.sort_by_key(|&(id, _)| id);
+        let ticks = self.clock.ticks();
+        self.gather_light_sources();
+        let view_rect = self.camera.visible_tiles(self.view.world());
+        let abs_tick = self.clock.day as u64 * DAY_TICKS as u64 + ticks as u64;
+        let t0 = get_time();
+        if self
+            .light
+            .update(self.view.world(), view_rect, ticks, abs_tick, &self.sources)
+        {
+            self.light_ms = (get_time() - t0) * 1000.0;
+            self.light_recomputes += 1;
+        }
+
+        // 6. Draw: sky backdrop, lit world, cracks, item drops, players,
+        // night vignette. Cracks and drops sample the light field so they
+        // fade into darkness with the tiles around them.
+        clear_background(render::sky_color(ticks));
+        render::draw_sky(ticks, now, &mut self.batch);
+        render::draw_world(
+            &self.view,
+            &self.camera,
+            &self.light,
+            &mut self.batch,
+            &mut self.corners,
+        );
+        self.interact.draw_cracks(now, tl, &self.light);
+        self.entities.draw(render_t, now, tl, &self.light);
+        for &(id, s) in &self.remote_samples {
+            let Some(remote) = self.remotes.get(&id) else {
+                continue;
+            };
             render::draw_player(&PlayerDraw {
                 pos: vec2(s.pos.0 * TILE_SIZE - tl.x, s.pos.1 * TILE_SIZE - tl.y),
                 world_x: s.pos.0,
@@ -370,9 +426,13 @@ impl Session {
                 name: &remote.name,
                 is_self: false,
                 held_item: remote.held_item,
+                light: self
+                    .light
+                    .brightness_at(s.pos.0 + PLAYER_WIDTH / 2.0, s.pos.1 + PLAYER_HEIGHT / 2.0),
             });
         }
         let p = &self.own.phys;
+        let own_center = p.center();
         render::draw_player(&PlayerDraw {
             pos: vec2(p.pos.0 * TILE_SIZE - tl.x, p.pos.1 * TILE_SIZE - tl.y),
             world_x: p.pos.0,
@@ -387,10 +447,17 @@ impl Session {
                 .copied()
                 .flatten()
                 .map(|s| s.item),
+            light: self.light.brightness_at(own_center.0, own_center.1),
         });
         self.interact.draw_aim(aim, center, tl);
+        // Night vignette, surface only (skip when buried — caves are dark
+        // everywhere, the edges shouldn't be extra-dark).
+        let own_tile = (own_center.0 as u32, own_center.1 as u32);
+        if self.light.sky_exposed(own_tile.0, own_tile.1) {
+            render::draw_vignette(1.0 - light::daylight(ticks), &mut self.batch);
+        }
 
-        // 6. Overlay UI.
+        // 7. Overlay UI.
         self.hud
             .draw(self.remotes.len() + 1, self.clock.day, self.clock.ticks());
         hotbar::draw(&self.inventory, self.selected);
@@ -402,32 +469,78 @@ impl Session {
                 self.own.phys.vel,
                 self.view.loaded_chunks(),
                 self.ws.bad_frames,
+                self.light_ms,
+                self.light_recomputes,
             );
         }
         None
+    }
+
+    /// Collects this frame's non-tile light sources (§10): every player
+    /// glows 4 at their center tile; a worn Mining Helmet emits 20 at the
+    /// own player's head. Remote helmets aren't knowable yet — the server
+    /// doesn't broadcast worn armor (only held items); if that lands, hook
+    /// it in here.
+    fn gather_light_sources(&mut self) {
+        self.sources.clear();
+        let center = self.own.phys.center();
+        self.sources.push(DynamicSource {
+            x: center.0 as i32,
+            y: center.1 as i32,
+            level: PLAYER_GLOW,
+        });
+        // Specifically the head slot (§10 ties the light to *wearing* the
+        // helmet): inventory slot `ARMOR_START + k`, in `ArmorSlot`
+        // declaration order (Head, Chest, Legs).
+        let head = self
+            .inventory
+            .get(inventory::ARMOR_START + ArmorSlot::Head as usize)
+            .copied()
+            .flatten()
+            .map(|s| s.item);
+        if head == Some(ItemId::MiningHelmet) {
+            let head_y = self.own.phys.pos.1 + render::HEAD_CENTER_PX / TILE_SIZE;
+            self.sources.push(DynamicSource {
+                x: center.0 as i32,
+                y: head_y as i32,
+                level: MINING_HELMET_LIGHT,
+            });
+        }
+        for &(_, s) in &self.remote_samples {
+            self.sources.push(DynamicSource {
+                x: (s.pos.0 + PLAYER_WIDTH / 2.0) as i32,
+                y: (s.pos.1 + PLAYER_HEIGHT / 2.0) as i32,
+                level: PLAYER_GLOW,
+            });
+        }
     }
 
     /// Applies one server message to the session state.
     fn apply(&mut self, msg: ServerMessage, now: f64) {
         match msg {
             ServerMessage::ChunkData { cx, cy, bytes } => {
-                if let Err(e) = self.view.apply_chunk(cx, cy, &bytes) {
-                    warn!("dropping bad chunk ({cx},{cy}): {e}");
+                match self.view.apply_chunk(cx, cy, &bytes) {
+                    Ok(()) => self.light.on_chunk_applied(self.view.world(), cx, cy),
+                    Err(e) => warn!("dropping bad chunk ({cx},{cy}): {e}"),
                 }
             }
             ServerMessage::TileChanged { x, y, tile } => {
                 self.view.apply_tile(x, y, tile);
                 self.interact.on_tile_changed(x, y);
+                self.light.on_tile_changed(self.view.world(), x, y);
             }
             ServerMessage::TilesChanged { changes } => {
                 for (x, y, tile) in changes {
                     self.view.apply_tile(x, y, tile);
                     self.interact.on_tile_changed(x, y);
+                    self.light.on_tile_changed(self.view.world(), x, y);
                 }
             }
             ServerMessage::BlockCrack { x, y, damage_frac } => {
                 self.interact.on_block_crack(x, y, damage_frac, now);
             }
+            // The armor slots inside the mirror feed lighting too: a worn
+            // Mining Helmet is a light source (§10).
             ServerMessage::InventorySync { slots } => {
                 self.inventory = slots;
                 self.inventory.resize(inventory::TOTAL, None);
@@ -504,7 +617,7 @@ impl Session {
             ServerMessage::Reject { .. }
             | ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. } => {}
-            // Inventory, entities, NPCs, health: rendered by later PRs.
+            // Entities, NPCs, health: rendered by later PRs.
             _ => {}
         }
     }

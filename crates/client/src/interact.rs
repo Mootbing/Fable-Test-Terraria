@@ -16,6 +16,7 @@ use ferraria_shared::tiles::{TileId, ToolKind, WallId, TILE_DAMAGE_RESET_SECS};
 use ferraria_shared::world::World;
 use ferraria_shared::{tile_in_reach, TILE_SIZE};
 
+use crate::light::LightEngine;
 use crate::net::WsClient;
 
 /// Hold-RMB placement repeat. Client-side UX pacing only — the server
@@ -175,8 +176,10 @@ impl Interact {
         );
     }
 
-    /// Draws the 3-stage crack overlay and prunes expired entries.
-    pub fn draw_cracks(&mut self, now: f64, cam_top_left: Vec2) {
+    /// Draws the 3-stage crack overlay and prunes expired entries. Crack
+    /// alpha scales with the tile's light so cracks fade into darkness with
+    /// the tile they're on instead of floating over black cells.
+    pub fn draw_cracks(&mut self, now: f64, cam_top_left: Vec2, light: &LightEngine) {
         self.cracks
             .retain(|_, &mut (_, at)| now - at <= TILE_DAMAGE_RESET_SECS as f64);
         for (&(x, y), &(frac, _)) in &self.cracks {
@@ -185,6 +188,16 @@ impl Interact {
             if px < -TILE_SIZE || py < -TILE_SIZE || px > screen_width() || py > screen_height() {
                 continue;
             }
+            let l = light.brightness_at(x as f32 + 0.5, y as f32 + 0.5);
+            if l <= 0.0 {
+                continue; // pitch black: the tile itself isn't visible
+            }
+            let crack = Color::new(
+                CRACK_COLOR.r,
+                CRACK_COLOR.g,
+                CRACK_COLOR.b,
+                CRACK_COLOR.a * l,
+            );
             let s = TILE_SIZE;
             let stage = 1 + (frac as u32 * 3 / 256).min(2); // 1..=3
             draw_line(
@@ -193,7 +206,7 @@ impl Interact {
                 px + s * 0.6,
                 py + s * 0.75,
                 1.5,
-                CRACK_COLOR,
+                crack,
             );
             if stage >= 2 {
                 draw_line(
@@ -202,7 +215,7 @@ impl Interact {
                     px + s * 0.45,
                     py + s * 0.6,
                     1.5,
-                    CRACK_COLOR,
+                    crack,
                 );
                 draw_line(
                     px + s * 0.3,
@@ -210,7 +223,7 @@ impl Interact {
                     px + s * 0.15,
                     py + s * 0.85,
                     1.5,
-                    CRACK_COLOR,
+                    crack,
                 );
             }
             if stage >= 3 {
@@ -220,7 +233,7 @@ impl Interact {
                     px + s * 0.85,
                     py + s * 0.9,
                     1.5,
-                    CRACK_COLOR,
+                    crack,
                 );
                 draw_line(
                     px + s * 0.65,
@@ -228,7 +241,7 @@ impl Interact {
                     px + s * 0.9,
                     py + s * 0.55,
                     1.5,
-                    CRACK_COLOR,
+                    crack,
                 );
                 draw_line(
                     px + s * 0.1,
@@ -236,7 +249,7 @@ impl Interact {
                     px + s * 0.35,
                     py + s * 0.35,
                     1.5,
-                    CRACK_COLOR,
+                    crack,
                 );
             }
         }

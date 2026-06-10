@@ -9,6 +9,7 @@
 //! - [`entities`] — mirror of server entities (item drops, later enemies).
 //! - [`interact`] — mouse aiming, mining/placing intents, crack overlay.
 //! - [`hotbar`] — hotbar selection + strip rendering.
+//! - [`light`] — client-side flood-fill lighting + day/night sky ramp.
 //! - [`render`] — camera, sky, tiles, player sprites.
 //! - [`ui`] — menus, HUD, chat, debug overlay.
 
@@ -16,6 +17,7 @@ mod app;
 mod entities;
 mod hotbar;
 mod interact;
+mod light;
 mod net;
 mod player;
 mod render;
