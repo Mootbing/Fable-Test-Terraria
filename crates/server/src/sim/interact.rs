@@ -17,7 +17,7 @@ use ferraria_shared::tiles::{
     WOOD_PER_TREE_SEGMENT,
 };
 use ferraria_shared::world::World;
-use ferraria_shared::{tile_in_reach, TICK_RATE};
+use ferraria_shared::{tile_in_reach, DOOR_TOGGLE_COOLDOWN_TICKS, TICK_RATE};
 
 use crate::worldgen::loot;
 
@@ -126,6 +126,16 @@ impl Sim {
         let Some(tool) = self.accept_swing(id, x, y) else {
             return;
         };
+        // §1.2 pass 9 forage: a mushroom plant on a grass cell harvests in
+        // one hit from anything (the recipe-#47 ingredient), leaving the
+        // grass itself undamaged.
+        if tile.id == TileId::Grass && state::variant(tile.state) == state::GRASS_MUSHROOM {
+            let mut t = tile;
+            t.state &= !state::VARIANT_MASK;
+            self.change_tile(x, y, t);
+            self.spawn_item_drop(ItemId::Mushroom, 1, (x as f32 + 0.5, y as f32 + 0.5));
+            return;
+        }
         if !tool_matches(data.tool, tool) {
             return;
         }
@@ -146,10 +156,12 @@ impl Sim {
         }
     }
 
-    /// `HitWall`: hammers only (§2 walls).
+    /// `HitWall`: hammers only (§2 walls). A wall sealed behind a solid
+    /// foreground tile can't be hit — mirroring `place_wall`, and keeping
+    /// the wall's drop from spawning inside the solid.
     pub(crate) fn hit_wall(&mut self, id: u32, x: u32, y: u32) {
         let tile = self.world.tile(x, y);
-        if tile.wall == WallId::Air {
+        if tile.wall == WallId::Air || tile.is_solid() {
             return;
         }
         let Some(tool) = self.accept_swing(id, x, y) else {
@@ -229,6 +241,12 @@ impl Sim {
             }
             id if id.data().size != (1, 1) => self.break_multitile(x, y),
             id => {
+                // A forage plant still standing on breaking grass pops with
+                // it (normally the forage swing in `hit_tile` harvests it
+                // first, but other break paths reach here directly).
+                if id == TileId::Grass && state::variant(tile.state) == state::GRASS_MUSHROOM {
+                    self.spawn_item_drop(ItemId::Mushroom, 1, (x as f32 + 0.5, y as f32 + 0.5));
+                }
                 self.clear_cell(x, y);
                 if let Some((item, n)) = id.data().drops {
                     self.spawn_item_drop(item, n as u16, (x as f32 + 0.5, y as f32 + 0.5));
@@ -327,9 +345,7 @@ impl Sim {
         let Some(p) = self.players.get(&id) else {
             return;
         };
-        if !tile_in_reach(p.center(), x, y) {
-            return;
-        }
+        let center = p.center();
         let Some(stack) = p.inventory.get(slot as usize).copied().flatten() else {
             return;
         };
@@ -339,12 +355,13 @@ impl Sim {
         let data = tile_id.data();
         let (w, h) = (data.size.0 as u32, data.size.1 as u32);
 
-        // Footprint must be empty (also checked atomically by
-        // place_multitile, but validating first keeps refusals side-effect
-        // free).
+        // The whole footprint must be in reach (§8) — checking only the
+        // origin would let a 4×2 bed extend cells ~4 tiles past it — and
+        // empty (also checked atomically by place_multitile, but validating
+        // first keeps refusals side-effect free).
         for dy in 0..h {
             for dx in 0..w {
-                if !self.world.is_empty(x + dx, y + dy) {
+                if !tile_in_reach(center, x + dx, y + dy) || !self.world.is_empty(x + dx, y + dy) {
                     return;
                 }
             }
@@ -403,7 +420,13 @@ impl Sim {
             }
             for dy in 0..h {
                 for dx in 0..w {
-                    let t = self.world.tile(x + dx, y + dy);
+                    let mut t = self.world.tile(x + dx, y + dy);
+                    if solid {
+                        // Solid footprints (Door) displace liquid like 1×1
+                        // solids — water must not survive inside a closed
+                        // door and drain out of it later.
+                        t.liquid = Liquid::NONE;
+                    }
                     self.change_tile(x + dx, y + dy, t);
                 }
             }
@@ -475,10 +498,18 @@ impl Sim {
         if !self.world.in_bounds(x, y) || self.world.tile(x, y).id != TileId::Door {
             return;
         }
+        let tick = self.tick;
         let Some(p) = self.players.get(&id) else {
             return;
         };
         if !tile_in_reach(p.center(), x, y) {
+            return;
+        }
+        // Anti-amplification: one toggle re-broadcasts the whole 1×3 column
+        // to every chunk subscriber, so accepted toggles are spaced out.
+        if p.last_door_toggle_tick
+            .is_some_and(|t| tick.saturating_sub(t) < DOOR_TOGGLE_COOLDOWN_TICKS)
+        {
             return;
         }
         let player_x = p.center().0;
@@ -491,6 +522,7 @@ impl Sim {
             if self.footprint_overlaps_hitbox(ox, oy, 1, h) {
                 return;
             }
+            self.consume_door_toggle(id);
             for dy in 0..h {
                 let mut t = self.world.tile(ox, oy + dy);
                 t.state &= !(state::DOOR_OPEN | state::DOOR_OPEN_LEFT);
@@ -519,6 +551,7 @@ impl Sim {
             } else {
                 return; // jammed: both sides blocked
             };
+            self.consume_door_toggle(id);
             for dy in 0..h {
                 let mut t = self.world.tile(ox, oy + dy);
                 t.state |= state::DOOR_OPEN;
@@ -528,6 +561,58 @@ impl Sim {
                     t.state &= !state::DOOR_OPEN_LEFT;
                 }
                 self.change_tile(ox, oy + dy, t);
+            }
+        }
+    }
+
+    /// Marks an accepted `ToggleDoor` against the player's
+    /// [`DOOR_TOGGLE_COOLDOWN_TICKS`] rate cap.
+    fn consume_door_toggle(&mut self, id: u32) {
+        let tick = self.tick;
+        if let Some(p) = self.players.get_mut(&id) {
+            p.last_door_toggle_tick = Some(tick);
+        }
+    }
+
+    /// Drains the support-check queue (`Sim::queue_support_checks`):
+    /// fixtures whose §2 support rule no longer holds pop, dropping their
+    /// item — a torch loses its attachment (solid neighbor or wall), a door
+    /// its lintel/sill, multi-tile furniture its floor. Pops re-queue their
+    /// own neighborhoods, so chains (a torch attached to a popping door)
+    /// resolve in the same pass; every pop removes an object, so the drain
+    /// terminates. Non-empty chests are the §2 exception: they refuse to
+    /// break and stay floating until emptied.
+    pub(crate) fn revalidate_supports(&mut self) {
+        while let Some((x, y)) = self.support_checks.pop() {
+            let t = self.world.tile(x, y);
+            match t.id {
+                // §2 tile 16: needs a wall behind or an adjacent
+                // solid/platform.
+                TileId::Torch => {
+                    if !has_support(&self.world, x, y) {
+                        self.break_tile(x, y);
+                    }
+                }
+                // §2 tile 18: needs solid tiles above and below the frame.
+                TileId::Door => {
+                    let (ox, oy) = self.world.multitile_origin(x, y);
+                    let h = TileId::Door.data().size.1 as u32;
+                    let framed = oy > 0
+                        && self.world.is_solid(ox as i32, oy as i32 - 1)
+                        && self.world.is_solid(ox as i32, (oy + h) as i32);
+                    if !framed {
+                        self.break_tile(x, y);
+                    }
+                }
+                // Multi-tile furniture stands on its floor.
+                id if id.data().furniture && id.data().size != (1, 1) => {
+                    let (ox, oy) = self.world.multitile_origin(x, y);
+                    let (w, h) = (id.data().size.0 as u32, id.data().size.1 as u32);
+                    if !floor_under(&self.world, ox, oy, w, h) {
+                        self.break_tile(x, y);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -590,7 +675,6 @@ mod tests {
     use super::*;
     use ferraria_shared::items::InvSlot;
     use ferraria_shared::protocol::ClientMessage;
-    use ferraria_shared::tiles::Tile;
     use tokio::sync::mpsc;
 
     const FLOOR: u32 = 30;
@@ -830,14 +914,18 @@ mod tests {
             .entities
             .map
             .values()
-            .map(|e| match e.kind {
-                EntityKind::ItemDrop { item, count } => (item, count),
+            .filter_map(|e| match e.kind {
+                EntityKind::ItemDrop { item, count } => Some((item, count)),
+                _ => None,
             })
             .collect();
         assert_eq!(drops.len(), 1);
         let (item, count) = drops[0];
+        // §2.3 coin rolls scale with depth; this floor row sits in the
+        // scaled world's cavern band (loot::pot_coin_mult).
+        let mult = loot::pot_coin_mult(y, sim.world().height);
         match item {
-            ItemId::SilverCoin => assert!((1..=10).contains(&count)),
+            ItemId::SilverCoin => assert!((mult..=10 * mult).contains(&count)),
             ItemId::Torch => assert!((3..=8).contains(&count)),
             ItemId::LesserHealingPotion => assert_eq!(count, 1),
             ItemId::WoodenArrow => assert!((10..=20).contains(&count)),
@@ -1043,6 +1131,7 @@ mod tests {
 
         // A player standing in the doorway blocks closing.
         place_player(&mut sim, id, x as f32 + 0.5, FLOOR as f32);
+        advance(&mut sim, DOOR_TOGGLE_COOLDOWN_TICKS as u32); // clear the rate cap
         msg(
             &mut sim,
             id,
@@ -1068,6 +1157,7 @@ mod tests {
         assert!(t.is_solid());
 
         // Player now right of the door: panel opens left.
+        advance(&mut sim, DOOR_TOGGLE_COOLDOWN_TICKS as u32);
         msg(
             &mut sim,
             id,
@@ -1078,6 +1168,254 @@ mod tests {
             sim.world().tile(x, FLOOR - 1).state & state::DOOR_OPEN_LEFT,
             0
         );
+    }
+
+    #[test]
+    fn mushroom_forage_yields_exactly_one_mushroom() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let (x, y) = (54, FLOOR - 1);
+        // A grass cell carrying the worldgen forage variant (§1.2 pass 9).
+        let mut t = sim.world().tile(x, y);
+        t.id = TileId::Grass;
+        t.state = state::GRASS_MUSHROOM;
+        sim.change_tile(x, y, t);
+
+        // Bare hands forage it in one swing: +1 Mushroom, grass untouched.
+        give_nothing(&mut sim, id, 0);
+        swing_tile(&mut sim, id, epoch, x, y);
+        assert_eq!(sim.world().tile(x, y).id, TileId::Grass, "grass survives");
+        assert_eq!(
+            state::variant(sim.world().tile(x, y).state),
+            0,
+            "variant cleared"
+        );
+        assert_eq!(dropped(&sim, ItemId::Mushroom), 1);
+
+        // Re-foraging the bare cell yields nothing (no dupes).
+        swing_tile(&mut sim, id, epoch, x, y);
+        assert_eq!(dropped(&sim, ItemId::Mushroom), 1);
+
+        // Other break paths on mushroom-bearing grass free the mushroom too.
+        let mut t = sim.world().tile(x, y);
+        t.state = state::GRASS_MUSHROOM;
+        sim.change_tile(x, y, t);
+        sim.break_tile(x, y);
+        assert_eq!(dropped(&sim, ItemId::Mushroom), 2);
+        assert_eq!(dropped(&sim, ItemId::Dirt), 1, "grass still drops dirt");
+    }
+
+    #[test]
+    fn fixtures_pop_when_their_support_is_removed() {
+        let (mut sim, id, epoch, _rx) = setup();
+
+        // Torch standing on a dirt block: mining the block pops the torch
+        // (end-to-end through the HitTile intent).
+        set(&mut sim, 54, FLOOR - 1, TileId::Dirt);
+        set(&mut sim, 54, FLOOR - 2, TileId::Torch);
+        give(&mut sim, id, 0, ItemId::EmberPickaxe, 1);
+        swing_tile(&mut sim, id, epoch, 54, FLOOR - 1);
+        assert_eq!(
+            sim.world().tile(54, FLOOR - 2).id,
+            TileId::Air,
+            "torch popped"
+        );
+        assert_eq!(dropped(&sim, ItemId::Torch), 1);
+
+        // Door: removing the lintel pops the whole door, dropping exactly
+        // one (the re-validation pass must not double-break the multitile).
+        let x = 47;
+        set(&mut sim, x, FLOOR - 4, TileId::Stone);
+        give(&mut sim, id, 0, ItemId::Door, 1);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x,
+                y: FLOOR - 3,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(sim.world().tile(x, FLOOR - 1).id, TileId::Door);
+        set(&mut sim, x, FLOOR - 4, TileId::Air);
+        sim.revalidate_supports();
+        for dy in 1..=3 {
+            assert_eq!(
+                sim.world().tile(x, FLOOR - dy).id,
+                TileId::Air,
+                "door fell apart (row -{dy})"
+            );
+        }
+        assert_eq!(dropped(&sim, ItemId::Door), 1, "exactly one door dropped");
+
+        // Workbench: knocking out part of its floor pops it.
+        assert!(sim.world.place_multitile(44, FLOOR - 1, TileId::Workbench));
+        set(&mut sim, 44, FLOOR, TileId::Air);
+        sim.revalidate_supports();
+        assert_eq!(sim.world().tile(44, FLOOR - 1).id, TileId::Air);
+        assert_eq!(sim.world().tile(45, FLOOR - 1).id, TileId::Air);
+        assert_eq!(dropped(&sim, ItemId::Workbench), 1);
+
+        // §2 exception: a non-empty chest refuses to break and floats.
+        assert!(sim.world.place_multitile(41, FLOOR - 2, TileId::Chest));
+        let mut slots = vec![None; ferraria_shared::world::CHEST_SLOTS];
+        slots[0] = Some(InvSlot::new(ItemId::Gel, 1));
+        sim.world.chests.insert((41, FLOOR - 2), slots);
+        set(&mut sim, 41, FLOOR, TileId::Air);
+        set(&mut sim, 42, FLOOR, TileId::Air);
+        sim.revalidate_supports();
+        assert_eq!(
+            sim.world().tile(41, FLOOR - 2).id,
+            TileId::Chest,
+            "non-empty chest survives unsupported"
+        );
+    }
+
+    #[test]
+    fn doors_placed_in_water_displace_it() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let x = 53;
+        set(&mut sim, x, FLOOR - 4, TileId::Stone); // lintel
+        for dy in 1..=3 {
+            let mut t = sim.world().tile(x, FLOOR - dy);
+            t.liquid = Liquid::new(LiquidKind::Water, 8);
+            sim.change_tile(x, FLOOR - dy, t);
+        }
+        give(&mut sim, id, 0, ItemId::Door, 1);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x,
+                y: FLOOR - 3,
+                hotbar_slot: 0,
+            },
+        );
+        for dy in 1..=3 {
+            let t = sim.world().tile(x, FLOOR - dy);
+            assert_eq!(t.id, TileId::Door);
+            assert!(
+                t.liquid.is_none(),
+                "solid door cell must hold no water (row -{dy})"
+            );
+        }
+    }
+
+    #[test]
+    fn multitile_placement_requires_full_footprint_reach() {
+        let (mut sim, id, epoch, _rx) = setup();
+        give(&mut sim, id, 0, ItemId::Bed, 2);
+        // Origin in reach, but the 4×2 bed's far cells stretch ~3 tiles
+        // past the §8 limit: refused, nothing consumed.
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x: 55,
+                y: FLOOR - 2,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(sim.world().tile(55, FLOOR - 2).id, TileId::Air);
+        assert_eq!(sim.players[&id].inventory[0].map(|s| s.count), Some(2));
+        // Whole footprint in reach: placed.
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x: 52,
+                y: FLOOR - 2,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(sim.world().tile(52, FLOOR - 2).id, TileId::Bed);
+        assert_eq!(sim.world().tile(55, FLOOR - 1).id, TileId::Bed);
+        assert_eq!(sim.players[&id].inventory[0].map(|s| s.count), Some(1));
+    }
+
+    #[test]
+    fn walls_behind_solid_blocks_cannot_be_hammered() {
+        let (mut sim, id, epoch, _rx) = setup();
+        // A player-placed wall sealed behind a stone block.
+        let (x, y) = (54, FLOOR - 1);
+        let mut t = sim.world().tile(x, y);
+        t.id = TileId::Stone;
+        t.wall = WallId::Wood;
+        t.state = state::WALL_PLACED;
+        sim.change_tile(x, y, t);
+        give(&mut sim, id, 0, ItemId::IronHammer, 1);
+        msg(&mut sim, id, epoch, ClientMessage::HitWall { x, y });
+        advance(&mut sim, 40);
+        assert_eq!(
+            sim.world().tile(x, y).wall,
+            WallId::Wood,
+            "sealed wall takes no hits (its drop would embed in the solid)"
+        );
+
+        // Mine the block; the wall hammers normally again.
+        give(&mut sim, id, 0, ItemId::EmberPickaxe, 1);
+        swing_tile(&mut sim, id, epoch, x, y);
+        assert_eq!(sim.world().tile(x, y).id, TileId::Air);
+        give(&mut sim, id, 0, ItemId::IronHammer, 1);
+        msg(&mut sim, id, epoch, ClientMessage::HitWall { x, y });
+        assert_eq!(sim.world().tile(x, y).wall, WallId::Air);
+        assert_eq!(dropped(&sim, ItemId::WoodWall), 1);
+    }
+
+    #[test]
+    fn door_toggles_are_rate_limited() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let x = 53;
+        set(&mut sim, x, FLOOR - 4, TileId::Stone);
+        give(&mut sim, id, 0, ItemId::Door, 1);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x,
+                y: FLOOR - 3,
+                hotbar_slot: 0,
+            },
+        );
+        let is_open = |sim: &Sim| sim.world().tile(x, FLOOR - 1).state & state::DOOR_OPEN != 0;
+
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::ToggleDoor { x, y: FLOOR - 2 },
+        );
+        assert!(is_open(&sim), "first toggle accepted");
+        // Same-tick spam: dropped (one toggle = 3 broadcast tile deltas).
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::ToggleDoor { x, y: FLOOR - 2 },
+        );
+        assert!(is_open(&sim), "spam toggle dropped");
+        // One tick shy of the cooldown: still dropped.
+        advance(&mut sim, DOOR_TOGGLE_COOLDOWN_TICKS as u32 - 1);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::ToggleDoor { x, y: FLOOR - 2 },
+        );
+        assert!(is_open(&sim), "cooldown still active");
+        // Cooldown elapsed: the toggle lands.
+        advance(&mut sim, 1);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::ToggleDoor { x, y: FLOOR - 2 },
+        );
+        assert!(!is_open(&sim), "post-cooldown toggle accepted");
     }
 
     #[test]

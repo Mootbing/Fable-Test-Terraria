@@ -27,12 +27,18 @@ use ferraria_shared::{
 
 use super::game::Sim;
 
-/// What an entity *is*. Currently only item drops; enemies, bosses, and
-/// projectiles slot in as new variants (each with its own system in the
-/// tick), reusing ids, snapshots, and visibility.
+/// What an entity *is*. Enemies, bosses, and projectiles slot in as new
+/// variants (each with its own system in the tick), reusing ids, snapshots,
+/// and visibility.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EntityKind {
-    ItemDrop { item: ItemId, count: u16 },
+    ItemDrop {
+        item: ItemId,
+        count: u16,
+    },
+    /// An unsupported sand tile in flight (§2 tile 4), stepped by
+    /// `Sim::step_falling_sand` and converted back to a tile on landing.
+    FallingSand,
 }
 
 /// One live entity. Positions are the AABB top-left in tile units, matching
@@ -52,6 +58,7 @@ impl Entity {
     pub fn size(&self) -> (f32, f32) {
         match self.kind {
             EntityKind::ItemDrop { .. } => hitbox::ITEM_DROP,
+            EntityKind::FallingSand => hitbox::FALLING_TILE,
         }
     }
 
@@ -120,6 +127,13 @@ fn spawn_message(id: u32, e: &Entity) -> ServerMessage {
             pos: e.pos,
             vel: e.vel,
         },
+        EntityKind::FallingSand => ServerMessage::EntitySpawn {
+            id,
+            kind: ferraria_shared::protocol::EntityKind::FallingSand,
+            pos: e.pos,
+            vel: e.vel,
+            state: 0,
+        },
     }
 }
 
@@ -159,6 +173,23 @@ impl Sim {
         self.spawn_item_drop_exact(item, count, center, vel, self.tick)
     }
 
+    /// Spawns a falling-sand entity occupying exactly the cell `(x, y)` (§2
+    /// tile 4: an unsupported sand tile leaves the grid and falls as an
+    /// entity until it lands on a solid).
+    pub(crate) fn spawn_falling_sand(&mut self, x: u32, y: u32) -> u32 {
+        let entity = Entity {
+            pos: (x as f32, y as f32),
+            vel: (0.0, 0.0),
+            kind: EntityKind::FallingSand,
+            spawn_tick: self.tick,
+            awake: true,
+        };
+        let id = self.entities.insert(entity);
+        let msg = spawn_message(id, &entity);
+        self.broadcast_at(x, y, &msg);
+        id
+    }
+
     /// Spawn with explicit velocity and spawn tick (merges/partial pickups
     /// preserve the original timer).
     pub(crate) fn spawn_item_drop_exact(
@@ -183,9 +214,11 @@ impl Sim {
         id
     }
 
-    /// Per-tick entity systems: item-drop physics, lava destruction, the
-    /// 10-minute despawn, stack merging, and player pickup.
+    /// Per-tick entity systems: falling-sand flight (§2 tile 4), item-drop
+    /// physics, lava destruction, the 10-minute despawn, stack merging, and
+    /// player pickup.
     pub(crate) fn tick_entities(&mut self) {
+        self.step_falling_sand();
         self.step_item_drops();
         self.merge_item_drops();
         self.pickup_item_drops();
@@ -195,6 +228,11 @@ impl Sim {
         let despawn_ticks = (ITEM_DESPAWN_SECS * TICK_RATE as f32) as u64;
         let mut gone: Vec<(u32, DespawnReason)> = Vec::new();
         for (&id, e) in self.entities.map.iter_mut() {
+            // Drops only: falling sand flies in `step_falling_sand` and
+            // never times out (it always lands).
+            let EntityKind::ItemDrop { item, .. } = e.kind else {
+                continue;
+            };
             let before = (e.pos, e.vel);
             step_item_drop(&self.world, &mut e.pos, &mut e.vel, DT);
             if e.pos != before.0 || e.vel != before.1 {
@@ -204,7 +242,6 @@ impl Sim {
                 gone.push((id, DespawnReason::Despawned));
                 continue;
             }
-            let EntityKind::ItemDrop { item, .. } = e.kind;
             if !item.lava_immune() && touches_liquid(&self.world, e, LiquidKind::Lava) {
                 gone.push((id, DespawnReason::Killed));
             }
@@ -230,9 +267,11 @@ impl Sim {
             .entities
             .map
             .iter()
-            .map(|(&id, e)| {
-                let EntityKind::ItemDrop { item, count } = e.kind;
-                DropView {
+            .filter_map(|(&id, e)| {
+                let EntityKind::ItemDrop { item, count } = e.kind else {
+                    return None;
+                };
+                Some(DropView {
                     id,
                     item,
                     count,
@@ -240,7 +279,7 @@ impl Sim {
                     vel: e.vel,
                     spawn_tick: e.spawn_tick,
                     awake: e.awake,
-                }
+                })
             })
             .collect();
         let mut consumed = vec![false; drops.len()];
@@ -303,9 +342,11 @@ impl Sim {
             .map
             .iter()
             .filter(|(_, e)| self.tick.saturating_sub(e.spawn_tick) >= arm_ticks)
-            .map(|(&id, e)| {
-                let EntityKind::ItemDrop { item, count } = e.kind;
-                DropView {
+            .filter_map(|(&id, e)| {
+                let EntityKind::ItemDrop { item, count } = e.kind else {
+                    return None;
+                };
+                Some(DropView {
                     id,
                     item,
                     count,
@@ -313,7 +354,7 @@ impl Sim {
                     vel: e.vel,
                     spawn_tick: e.spawn_tick,
                     awake: e.awake,
-                }
+                })
             })
             .collect();
         for DropView {

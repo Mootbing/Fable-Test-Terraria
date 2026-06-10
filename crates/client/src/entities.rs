@@ -14,6 +14,7 @@ use macroquad::prelude::*;
 use ferraria_shared::items::ItemId;
 use ferraria_shared::physics::hitbox;
 use ferraria_shared::protocol::{EntityKind, EntityState};
+use ferraria_shared::tiles::TileId;
 use ferraria_shared::TILE_SIZE;
 
 use crate::render::item_color;
@@ -37,8 +38,8 @@ pub enum Kind {
         item: ItemId,
         count: u16,
     },
-    /// Enemies/projectiles (rendered by later branches).
-    #[allow(dead_code)]
+    /// Falling sand draws as its tile; enemies/projectiles render in later
+    /// branches.
     Other(EntityKind),
 }
 
@@ -153,13 +154,25 @@ impl Entities {
         self.map.remove(&id);
     }
 
-    /// Draws all item drops (bob + spin) and the name tooltip of the one
-    /// under the mouse, if any.
+    /// Draws all item drops (bob + spin), falling-sand tiles, and the name
+    /// tooltip of the drop under the mouse, if any.
     pub fn draw(&mut self, render_t: f64, now: f64, cam_top_left: Vec2) {
         let (mouse_x, mouse_y) = mouse_position();
         let mut tooltip: Option<(String, f32, f32)> = None;
         let (w, h) = hitbox::ITEM_DROP;
         for (&id, e) in self.map.iter_mut() {
+            // Falling sand (§2 tile 4) renders as the tile it is.
+            if matches!(e.kind, Kind::Other(EntityKind::FallingSand)) {
+                let pos = e.sample(render_t);
+                draw_rectangle(
+                    pos.0 * TILE_SIZE - cam_top_left.x,
+                    pos.1 * TILE_SIZE - cam_top_left.y,
+                    TILE_SIZE,
+                    TILE_SIZE,
+                    crate::render::tile_color(TileId::Sand),
+                );
+                continue;
+            }
             let Kind::Item { item, count } = e.kind else {
                 continue; // enemies/projectiles render in later branches
             };

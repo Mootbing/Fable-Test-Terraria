@@ -88,6 +88,8 @@ pub mod hitbox {
     pub const ITEM_DROP: (f32, f32) = (0.75, 0.75);
     pub const ARROW: (f32, f32) = (0.5, 0.5);
     pub const VOID_SICKLE: (f32, f32) = (1.0, 1.0);
+    /// A falling tile (§2 tile 4 sand) is exactly one cell.
+    pub const FALLING_TILE: (f32, f32) = (1.0, 1.0);
 }
 
 /// Fall damage for a completed fall (§8). Mitigations (Lucky Charm, Gust Jar
@@ -528,6 +530,40 @@ pub fn step_item_drop(world: &World, pos: &mut (f32, f32), vel: &mut (f32, f32),
         } else {
             vel.0 -= f * vel.0.signum();
         }
+    }
+    hit_floor
+}
+
+/// Advances one falling-tile entity (§2 tile 4: unsupported sand) by `dt`
+/// seconds: a straight vertical fall under gravity capped at the §0 terminal
+/// velocity (×§3 multipliers while submerged), colliding with **solid** tiles
+/// only — a falling tile passes through platforms and non-solid fixtures,
+/// since §2 keys its support on "no solid tile below". Returns `true` when
+/// the step ended resting on a solid (the server then converts the entity
+/// back into a tile). Server-side only, but deterministic stepping lives
+/// here with the rest.
+pub fn step_falling_tile(
+    world: &World,
+    pos: &mut (f32, f32),
+    vel: &mut (f32, f32),
+    dt: f32,
+) -> bool {
+    let size = hitbox::FALLING_TILE;
+    let submerged = liquid_at_center(world, *pos, size).is_some();
+    let (g_mult, t_mult) = if submerged {
+        (LIQUID_GRAVITY_MULT, LIQUID_TERMINAL_MULT)
+    } else {
+        (1.0, 1.0)
+    };
+    vel.1 += GRAVITY * g_mult * dt;
+    let terminal = TERMINAL_VELOCITY * t_mult;
+    if vel.1 > terminal {
+        vel.1 = terminal;
+    }
+    let (ny, hit_floor, _) = sweep_y(world, *pos, size, vel.1 * dt, true);
+    pos.1 = ny;
+    if hit_floor {
+        vel.1 = 0.0;
     }
     hit_floor
 }

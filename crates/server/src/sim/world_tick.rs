@@ -7,14 +7,19 @@
 //! (`ServerMessage` is `ferraria_shared::protocol`'s); player-driven changes
 //! keep the immediate single-cell `TileChanged` path.
 
+use ferraria_shared::items::ItemId;
+use ferraria_shared::physics::{step_falling_tile, COLLISION_EPS, PLAYER_HEIGHT, PLAYER_WIDTH};
+use ferraria_shared::protocol::DespawnReason;
 use ferraria_shared::tiles::{
-    Liquid, LiquidKind, TileId, GRASS_SPREAD_DENOM, LAVA_UPDATE_TICKS, PUDDLE_EVAPORATE_SECS,
-    SAPLING_AIR_NEEDED, TREE_HEIGHT_MAX, TREE_HEIGHT_MIN, WATER_UPDATE_TICKS,
+    state, Liquid, LiquidKind, TileId, GRASS_SPREAD_DENOM, LAVA_UPDATE_TICKS,
+    PUDDLE_EVAPORATE_SECS, SAPLING_AIR_NEEDED, TREE_HEIGHT_MAX, TREE_HEIGHT_MIN,
+    WATER_UPDATE_TICKS,
 };
-use ferraria_shared::TICK_RATE;
+use ferraria_shared::{DT, TICK_RATE};
 
 use crate::worldgen::plant_tree;
 
+use super::entities::EntityKind;
 use super::game::Sim;
 
 /// Slow housekeeping (sapling growth checks, puddle evaporation, damage-map
@@ -64,55 +69,144 @@ impl Sim {
         }
     }
 
-    /// §2 tile 4: unsupported sand descends one cell per tick (instant tile
-    /// descent), sinking through liquids (displacing them upward) and
-    /// settling on any non-air foreground.
+    /// §2 tile 4: a sand cell with no **solid** tile below leaves the grid
+    /// and becomes a falling-sand entity (stepped by
+    /// [`Sim::step_falling_sand`], 37.5 t/s terminal cap). Non-solid
+    /// fixtures (torches, pots, open doors, ...) do not support sand.
     fn step_sand(&mut self) {
         if self.sand_active.is_empty() {
             return;
         }
         let mut cells: Vec<(u32, u32)> = self.sand_active.drain().collect();
-        // Bottom-up so a whole column moves together within one tick.
+        // Bottom-up so a whole column launches in order.
         cells.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         for (x, y) in cells {
             if self.world.tile(x, y).id != TileId::Sand {
                 continue;
             }
-            let below_y = y + 1;
-            if below_y >= self.world.height {
+            if y + 1 >= self.world.height {
                 continue; // world floor supports it
             }
-            let below = self.world.tile(x, below_y);
-            if below.id != TileId::Air {
-                continue; // settled on a solid (or any foreground object)
+            if self.world.is_solid(x as i32, y as i32 + 1) {
+                continue; // §2: only a solid tile below supports sand
             }
-            // Move down one cell, displacing the destination's liquid into
-            // the vacated cell so volume is conserved.
-            let mut src = self.world.tile(x, y);
-            let displaced = below.liquid;
-            let mut dst = below;
-            dst.id = TileId::Sand;
-            dst.liquid = Liquid::NONE;
-            dst.state &= ferraria_shared::tiles::state::WALL_PLACED;
-            src.id = TileId::Air;
-            src.liquid = displaced;
-            src.state &= ferraria_shared::tiles::state::WALL_PLACED;
-            self.world.set_tile(x, y, src);
-            self.world.set_tile(x, below_y, dst);
+            let mut t = self.world.tile(x, y);
+            t.id = TileId::Air;
+            t.state &= state::WALL_PLACED;
+            self.world.set_tile(x, y, t);
             self.stage_tile(x, y);
-            self.stage_tile(x, below_y);
+            // Partial mining cracks don't follow the entity.
+            self.tile_damage.remove(&(x, y, false));
             self.fluids.mark(x, y);
+            self.fluids.mark(x.wrapping_sub(1), y);
+            self.fluids.mark(x + 1, y);
             self.fluids.mark(x, y.wrapping_sub(1));
-            self.fluids.mark(x, below_y + 1);
-            self.fluids.mark(x.wrapping_sub(1), below_y);
-            self.fluids.mark(x + 1, below_y);
-            // Keep falling next tick; the sand that may rest on the vacated
-            // cell falls too.
-            self.sand_active.insert((x, below_y));
+            self.fluids.mark(x, y + 1);
+            self.queue_support_checks(x, y);
+            self.spawn_falling_sand(x, y);
+            // The sand resting on the vacated cell follows next tick.
             if y > 0 && self.world.tile(x, y - 1).id == TileId::Sand {
                 self.sand_active.insert((x, y - 1));
             }
         }
+    }
+
+    /// Integrates falling-sand entities (§2 tile 4): gravity under the §0
+    /// terminal cap and §3 liquid multipliers, colliding with solids only.
+    /// A landed entity converts back into a sand tile in the cell it rests
+    /// in; see [`Sim::settle_falling_sand`] for the occupied-cell rules.
+    pub(crate) fn step_falling_sand(&mut self) {
+        let falling: Vec<u32> = self
+            .entities
+            .map
+            .iter()
+            .filter(|(_, e)| matches!(e.kind, EntityKind::FallingSand))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in falling {
+            let Some(e) = self.entities.map.get(&id) else {
+                continue;
+            };
+            let (mut pos, mut vel) = (e.pos, e.vel);
+            let landed = step_falling_tile(&self.world, &mut pos, &mut vel, DT);
+            if let Some(e) = self.entities.map.get_mut(&id) {
+                e.pos = pos;
+                e.vel = vel;
+                e.awake = true;
+            }
+            if landed {
+                self.settle_falling_sand(id);
+            }
+        }
+    }
+
+    /// Converts a landed falling-sand entity back into a tile. A lone
+    /// one-hit 1×1 fixture in the landing cell (torch, pot, cobweb,
+    /// sapling, ...) pops first, dropping its item/loot; anything sturdier
+    /// (multi-tile furniture, tree trunks, open doors) survives and the sand
+    /// becomes an item drop instead — as it also does when solidifying
+    /// would bury a player. The landing cell's liquid is displaced into the
+    /// cell above where there is room.
+    fn settle_falling_sand(&mut self, id: u32) {
+        let Some(e) = self.entities.map.get(&id) else {
+            return;
+        };
+        // The entity never moves horizontally and landing clamps its top
+        // edge just above the supporting row, so rounding recovers the cell.
+        let (cx, cy) = (e.pos.0 + 0.5, e.pos.1 + 0.5);
+        if cx < 0.0 || cy < 0.0 {
+            self.despawn_entity(id, DespawnReason::Despawned);
+            return;
+        }
+        let (x, y) = (cx as u32, cy as u32);
+        if !self.world.in_bounds(x, y) {
+            self.despawn_entity(id, DespawnReason::Despawned);
+            return;
+        }
+        let center = (x as f32 + 0.5, y as f32 + 0.5);
+        let target = self.world.tile(x, y);
+        let data = target.id.data();
+        if target.id != TileId::Air && data.one_hit && data.size == (1, 1) && data.breakable {
+            self.break_tile(x, y);
+        }
+        let occupied = self.world.tile(x, y).id != TileId::Air;
+        if occupied || self.sand_would_bury_player(x, y) {
+            self.despawn_entity(id, DespawnReason::Despawned);
+            self.spawn_item_drop(ItemId::Sand, 1, center);
+            return;
+        }
+        let mut t = self.world.tile(x, y);
+        let displaced = t.liquid;
+        t.id = TileId::Sand;
+        t.liquid = Liquid::NONE;
+        t.state &= state::WALL_PLACED;
+        self.despawn_entity(id, DespawnReason::Despawned);
+        self.change_tile(x, y, t);
+        if displaced.is_some() && y > 0 {
+            let mut above = self.world.tile(x, y - 1);
+            if !above.is_solid() && above.liquid.is_none() {
+                above.liquid = displaced;
+                self.change_tile(x, y - 1, above);
+            }
+            // Else the volume is lost, matching how placed solids displace
+            // (destroy) liquid (§2 placement).
+        }
+    }
+
+    /// Whether solidifying a sand tile at `(x, y)` would overlap a player's
+    /// hitbox (shrunk by the collision skin so flush contacts don't count).
+    fn sand_would_bury_player(&self, x: u32, y: u32) -> bool {
+        let (rx0, ry0) = (x as f32 + COLLISION_EPS, y as f32 + COLLISION_EPS);
+        let (rx1, ry1) = (
+            (x + 1) as f32 - COLLISION_EPS,
+            (y + 1) as f32 - COLLISION_EPS,
+        );
+        self.players.values().any(|p| {
+            p.pos.0 < rx1
+                && p.pos.0 + PLAYER_WIDTH > rx0
+                && p.pos.1 < ry1
+                && p.pos.1 + PLAYER_HEIGHT > ry0
+        })
     }
 
     /// The random-tick system: each tile has a ~1/[`GRASS_SPREAD_DENOM`]
@@ -139,8 +233,13 @@ impl Sim {
                 if !air_exposed(&self.world, x, y) {
                     let mut t = t;
                     t.id = TileId::Dirt;
+                    // A buried forage plant dies with the grass.
+                    t.state &= !state::VARIANT_MASK;
                     self.world.set_tile(x, y, t);
                     self.stage_tile(x, y);
+                    // The cell's foreground changed: mining cracks on the
+                    // grass must not carry over to the dirt.
+                    self.tile_damage.remove(&(x, y, false));
                     return;
                 }
                 let (xi, yi) = (x as i32, y as i32);
@@ -168,6 +267,7 @@ impl Sim {
                     n.id = TileId::Grass;
                     self.world.set_tile(nx, ny, n);
                     self.stage_tile(nx, ny);
+                    self.tile_damage.remove(&(nx, ny, false));
                 }
             }
             // Safety net for torches that ended up under water through any
@@ -215,6 +315,7 @@ impl Sim {
                 self.saplings.remove(&(x, y));
                 for i in 1..=height {
                     self.stage_tile(x, y + 1 - i);
+                    self.tile_damage.remove(&(x, y + 1 - i, false));
                 }
             } else {
                 // Couldn't grow after all; put the sapling back.
@@ -372,8 +473,24 @@ mod tests {
         );
     }
 
+    /// Runs ticks until no falling-sand entity remains (or panics).
+    fn settle_sand(sim: &mut super::super::game::Sim, max_ticks: u32) {
+        for _ in 0..max_ticks {
+            advance(sim, 1);
+            let falling = sim
+                .entities
+                .map
+                .values()
+                .any(|e| matches!(e.kind, EntityKind::FallingSand));
+            if !falling {
+                return;
+            }
+        }
+        panic!("falling sand never settled within {max_ticks} ticks");
+    }
+
     #[test]
-    fn sand_columns_collapse_one_cell_per_tick() {
+    fn unsupported_sand_columns_fall_as_entities_and_resettle() {
         let mut sim = flat_sim(100, 60, FLOOR);
         let (_id, _epoch, mut rx) = join(&mut sim, "alice");
         drain(&mut rx);
@@ -385,29 +502,36 @@ mod tests {
             set_tile(&mut sim, x, shelf - dy, TileId::Sand);
         }
         drain(&mut rx);
-        // Knock out the shelf: the column descends 1 cell per tick, moving
-        // as a unit, until it rests on the floor.
+        // Knock out the shelf: the column converts to falling entities (§2
+        // tile 4: "becomes falling entity").
         set_tile(&mut sim, x, shelf, TileId::Air);
 
         advance(&mut sim, 1);
-        assert_eq!(sim.world().tile(x, shelf).id, TileId::Sand, "fell 1");
-        assert_eq!(sim.world().tile(x, shelf - 1).id, TileId::Sand);
         assert_eq!(
-            sim.world().tile(x, shelf - 3).id,
+            sim.world().tile(x, shelf - 1).id,
             TileId::Air,
-            "top vacated"
+            "bottom sand left the grid"
         );
         assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|m| matches!(m, ServerMessage::TilesChanged { .. })),
-            "sand movement batches"
+            sim.entities
+                .map
+                .values()
+                .any(|e| matches!(e.kind, EntityKind::FallingSand)),
+            "a falling-sand entity exists"
+        );
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ServerMessage::EntitySpawn {
+                    kind: ferraria_shared::protocol::EntityKind::FallingSand,
+                    ..
+                }
+            )),
+            "falling sand announces itself as an entity: {msgs:?}"
         );
 
-        advance(&mut sim, 1);
-        assert_eq!(sim.world().tile(x, shelf + 1).id, TileId::Sand, "fell 2");
-
-        advance(&mut sim, 6);
+        settle_sand(&mut sim, 120);
         // Settled: 3 sand resting on the floor, nothing floating above.
         for dy in 1..=3 {
             assert_eq!(sim.world().tile(x, FLOOR - dy).id, TileId::Sand);
@@ -417,19 +541,58 @@ mod tests {
             .filter(|&y| sim.world().tile(x, y).id == TileId::Sand)
             .count();
         assert_eq!(total, 3, "sand conserved");
+        // The settles were broadcast (immediate TileChanged per landing).
+        assert!(drain(&mut rx).iter().any(|m| matches!(m,
+            ServerMessage::TileChanged { tile, .. } if tile.id == TileId::Sand)));
+    }
+
+    #[test]
+    fn falling_sand_respects_the_terminal_velocity_cap() {
+        // §2 tile 4: 37.5 t/s cap. A long free fall must never exceed it
+        // (the old tile-stepped descent moved 60 t/s).
+        let floor = 180;
+        let mut sim = flat_sim(60, 200, floor);
+        set_tile(&mut sim, 30, 20, TileId::Sand);
+        let mut max_vel: f32 = 0.0;
+        for _ in 0..500 {
+            advance(&mut sim, 1);
+            let mut falling = false;
+            for e in sim.entities.map.values() {
+                if matches!(e.kind, EntityKind::FallingSand) {
+                    falling = true;
+                    max_vel = max_vel.max(e.vel.1);
+                }
+            }
+            if !falling && sim.world().tile(30, floor - 1).id == TileId::Sand {
+                break;
+            }
+        }
+        assert_eq!(sim.world().tile(30, floor - 1).id, TileId::Sand, "landed");
+        assert!(
+            max_vel > ferraria_shared::TERMINAL_VELOCITY * 0.9,
+            "long fall reaches terminal velocity, peaked at {max_vel}"
+        );
+        assert!(
+            max_vel <= ferraria_shared::TERMINAL_VELOCITY + 1e-3,
+            "§0 cap exceeded: {max_vel}"
+        );
     }
 
     #[test]
     fn sand_sinks_through_water_displacing_it() {
         let mut sim = flat_sim(100, 60, FLOOR);
         let x = 52;
+        // A 1-wide stone cup so the water can't equalize away while the
+        // sand is in flight.
+        set_tile(&mut sim, x - 1, FLOOR - 1, TileId::Stone);
+        set_tile(&mut sim, x + 1, FLOOR - 1, TileId::Stone);
         // Water resting on the floor with sand floating right above it.
         let mut w = Tile::AIR;
         w.liquid = Liquid::new(LiquidKind::Water, 8);
         sim.change_tile(x, FLOOR - 1, w);
         set_tile(&mut sim, x, FLOOR - 2, TileId::Sand);
 
-        advance(&mut sim, 1);
+        settle_sand(&mut sim, 120);
         assert_eq!(sim.world().tile(x, FLOOR - 1).id, TileId::Sand, "sank");
         assert_eq!(
             sim.world().tile(x, FLOOR - 1).liquid.level(),
@@ -441,6 +604,143 @@ mod tests {
             8,
             "water displaced upward"
         );
+    }
+
+    #[test]
+    fn sand_does_not_rest_on_fixtures_and_pops_one_hit_ones() {
+        // §2 row 4 says sand falls "if no solid tile below" — torches, pots
+        // and other non-solid fixtures are not support. A 1×1 one-hit
+        // fixture in the landing cell pops (dropping its item) and the sand
+        // settles in its place.
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let x = 60;
+        set_tile(&mut sim, x, FLOOR - 1, TileId::Torch);
+        set_tile(&mut sim, x, FLOOR - 3, TileId::Sand);
+
+        settle_sand(&mut sim, 120);
+        assert_eq!(
+            sim.world().tile(x, FLOOR - 1).id,
+            TileId::Sand,
+            "sand landed where the torch stood"
+        );
+        let torch_drops: u32 = sim
+            .entities
+            .map
+            .values()
+            .filter_map(|e| match e.kind {
+                EntityKind::ItemDrop {
+                    item: ferraria_shared::items::ItemId::Torch,
+                    count,
+                } => Some(count as u32),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(torch_drops, 1, "the popped torch dropped its item");
+    }
+
+    #[test]
+    fn sand_blocked_by_furniture_becomes_an_item_drop() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let x = 60;
+        // A chest (2×2, not one-hit-poppable by sand) on the floor.
+        assert!(sim.world.place_multitile(x, FLOOR - 2, TileId::Chest));
+        set_tile(&mut sim, x, FLOOR - 3, TileId::Sand);
+
+        settle_sand(&mut sim, 120);
+        assert_eq!(sim.world().tile(x, FLOOR - 2).id, TileId::Chest, "intact");
+        assert_eq!(sim.world().tile(x, FLOOR - 1).id, TileId::Chest, "intact");
+        let sand_drops: u32 = sim
+            .entities
+            .map
+            .values()
+            .filter_map(|e| match e.kind {
+                EntityKind::ItemDrop {
+                    item: ferraria_shared::items::ItemId::Sand,
+                    count,
+                } => Some(count as u32),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(sand_drops, 1, "the sand became an item instead");
+    }
+
+    #[test]
+    fn sand_never_solidifies_inside_a_player() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        drain(&mut rx);
+        place_player(&mut sim, id, 60.5, FLOOR as f32);
+        // Sand dropped straight onto the player's column.
+        set_tile(&mut sim, 60, FLOOR - 6, TileId::Sand);
+
+        settle_sand(&mut sim, 120);
+        for dy in 1..=6 {
+            assert_ne!(
+                sim.world().tile(60, FLOOR - dy).id,
+                TileId::Sand,
+                "no sand tile materialized in the player's column (row -{dy})"
+            );
+        }
+        // The sand survives as an item: still a drop, or already picked up.
+        let dropped: u32 = sim
+            .entities
+            .map
+            .values()
+            .filter_map(|e| match e.kind {
+                EntityKind::ItemDrop {
+                    item: ferraria_shared::items::ItemId::Sand,
+                    count,
+                } => Some(count as u32),
+                _ => None,
+            })
+            .sum();
+        let carried: u32 = sim.players[&id]
+            .inventory
+            .iter()
+            .flatten()
+            .filter(|s| s.item == ferraria_shared::items::ItemId::Sand)
+            .map(|s| s.count as u32)
+            .sum();
+        assert_eq!(dropped + carried, 1, "sand conserved as an item");
+    }
+
+    #[test]
+    fn system_tile_changes_clear_mining_damage() {
+        // Batched (stage_tile-path) foreground changes must not leave §2
+        // break-points behind: sand that falls away used to bequeath its
+        // cracks to whatever landed there next.
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (x, y) = (52, FLOOR - 3);
+        set_tile(&mut sim, x, y + 1, TileId::Stone); // shelf
+        set_tile(&mut sim, x, y, TileId::Sand);
+        sim.tile_damage.insert(
+            (x, y, false),
+            super::super::interact::TileDamage {
+                damage: 75.0,
+                last_hit_tick: sim.tick,
+            },
+        );
+        set_tile(&mut sim, x, y + 1, TileId::Air); // unsupport it
+        advance(&mut sim, 1);
+        assert_eq!(sim.world().tile(x, y).id, TileId::Air, "sand left");
+        assert!(
+            !sim.tile_damage.contains_key(&(x, y, false)),
+            "stale damage purged when the system vacated the cell"
+        );
+
+        // Grass dying by random tick clears its cell's damage too.
+        let (gx, gy) = (60, FLOOR + 2); // covered: inside the floor slab
+        set_tile(&mut sim, gx, gy, TileId::Grass);
+        sim.tile_damage.insert(
+            (gx, gy, false),
+            super::super::interact::TileDamage {
+                damage: 75.0,
+                last_hit_tick: sim.tick,
+            },
+        );
+        sim.random_tick_cell(gx, gy);
+        assert_eq!(sim.world().tile(gx, gy).id, TileId::Dirt);
+        assert!(!sim.tile_damage.contains_key(&(gx, gy, false)));
     }
 
     #[test]

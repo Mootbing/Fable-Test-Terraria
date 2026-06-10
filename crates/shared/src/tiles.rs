@@ -421,6 +421,16 @@ pub mod state {
     /// `ItemId::Mushroom` and clears the variant, handled server-side).
     pub const GRASS_MUSHROOM: u8 = 1;
 
+    /// The sprite-variant bits (0–2) of a 1×1 tile's state byte — the same
+    /// bits multi-tile parts use for [`part_x`].
+    pub const VARIANT_MASK: u8 = 0x7;
+
+    /// Sprite variant of a 1×1 tile (grass mushroom, tree segment kind).
+    #[inline]
+    pub const fn variant(state: u8) -> u8 {
+        state & VARIANT_MASK
+    }
+
     /// Packs a multi-tile part offset. `dx` 0–7, `dy` 0–3.
     #[inline]
     pub const fn part(dx: u8, dy: u8) -> u8 {

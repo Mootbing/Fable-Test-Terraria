@@ -89,6 +89,18 @@ pub const SNAPSHOT_INTERVAL_TICKS: u32 = 3;
 /// `TimeSync` cadence: once per real second.
 pub const TIME_SYNC_INTERVAL_TICKS: u32 = 60;
 
+/// `PlayerHeldItem` rebroadcasts triggered by `SelectSlot` are coalesced to
+/// at most one per player per this many ticks (the trailing selection still
+/// goes out once the window elapses). Without it one inbound frame amplifies
+/// into a broadcast to every player at socket speed.
+pub const HELD_ITEM_BROADCAST_MIN_TICKS: u64 = SNAPSHOT_INTERVAL_TICKS as u64;
+
+/// Accepted `ToggleDoor` intents are spaced at least this many ticks apart
+/// per player — one toggle re-broadcasts a whole door column of tile deltas
+/// to every chunk subscriber. 10 ticks ≈ 0.17 s, the fastest §4.1 use time,
+/// so legitimate play never notices.
+pub const DOOR_TOGGLE_COOLDOWN_TICKS: u64 = 10;
+
 /// Chat messages are stripped of control characters, trimmed, and capped to
 /// this many characters.
 pub const CHAT_MAX_CHARS: usize = 200;

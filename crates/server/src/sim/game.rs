@@ -31,8 +31,9 @@ use ferraria_shared::world::{
     World, CHUNK_SIZE, CHUNK_SUB_HYSTERESIS, CHUNK_SUB_RADIUS_X, CHUNK_SUB_RADIUS_Y, DAY_TICKS,
 };
 use ferraria_shared::{
-    CHAT_MAX_CHARS, MAX_NAME_CHARS, MAX_PLAYERS, MAX_PLAYER_SPEED, MAX_TELEPORT_BUDGET_TILES,
-    MAX_TELEPORT_PER_TICK, SNAPSHOT_INTERVAL_TICKS, TICK_RATE, TIME_SYNC_INTERVAL_TICKS,
+    CHAT_MAX_CHARS, HELD_ITEM_BROADCAST_MIN_TICKS, MAX_NAME_CHARS, MAX_PLAYERS, MAX_PLAYER_SPEED,
+    MAX_TELEPORT_BUDGET_TILES, MAX_TELEPORT_PER_TICK, SNAPSHOT_INTERVAL_TICKS, TICK_RATE,
+    TIME_SYNC_INTERVAL_TICKS,
 };
 
 use super::entities::EntityStore;
@@ -117,6 +118,16 @@ pub(crate) struct Player {
     /// Tick of the last accepted tool swing (`HitTile`/`HitWall` rate
     /// limiting, §2/§4.1); `None` until the first swing of the session.
     pub(crate) last_swing_tick: Option<u64>,
+    /// Tick of the last accepted `ToggleDoor`
+    /// ([`crate::sim::interact`]-enforced anti-amplification cooldown,
+    /// [`ferraria_shared::DOOR_TOGGLE_COOLDOWN_TICKS`]).
+    pub(crate) last_door_toggle_tick: Option<u64>,
+    /// Tick of the last selection-driven `PlayerHeldItem` broadcast;
+    /// `SelectSlot` floods coalesce against it
+    /// ([`ferraria_shared::HELD_ITEM_BROADCAST_MIN_TICKS`]).
+    last_held_broadcast_tick: Option<u64>,
+    /// A coalesced selection broadcast is pending for this player.
+    held_broadcast_dirty: bool,
     tx: mpsc::Sender<Frame>,
 }
 
@@ -186,6 +197,11 @@ pub struct Sim {
     /// Cells changed by batched systems this tick, flushed as one
     /// [`ServerMessage::TilesChanged`] per subscribed player.
     tile_batch: Vec<(u32, u32)>,
+    /// Cells whose fixtures must re-validate their §2 support rules after a
+    /// nearby change (torch attachment, furniture floors, door frames).
+    /// Queued by [`Sim::queue_support_checks`], drained by
+    /// `Sim::revalidate_supports` after every command and every tick.
+    pub(crate) support_checks: Vec<(u32, u32)>,
 }
 
 impl Sim {
@@ -210,6 +226,7 @@ impl Sim {
             puddles: HashMap::new(),
             loot_rng: Pcg32::new(entropy_seed() ^ 0x1007_caf3),
             tile_batch: Vec::new(),
+            support_checks: Vec::new(),
         };
         sim.scan_initial_puddles();
         sim
@@ -232,6 +249,9 @@ impl Sim {
             } => self.handle_message(player_id, epoch, msg),
             SimCommand::Disconnect { player_id, epoch } => self.disconnect(player_id, epoch),
         }
+        // Fixtures whose support the command removed pop before anything
+        // else observes the world.
+        self.revalidate_supports();
         self.flush_kicks();
     }
 
@@ -283,6 +303,8 @@ impl Sim {
         // per player at the end of the tick.
         self.world_tick();
         self.tick_entities();
+        self.revalidate_supports();
+        self.flush_held_item_broadcasts();
         self.flush_tile_batch();
         if self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS as u64) {
             self.broadcast_entity_updates();
@@ -355,6 +377,9 @@ impl Sim {
             // One tick of allowance until the first state replenishes it.
             move_budget: MAX_TELEPORT_PER_TICK,
             last_swing_tick: None,
+            last_door_toggle_tick: None,
+            last_held_broadcast_tick: None,
+            held_broadcast_dirty: false,
             tx,
         };
 
@@ -574,11 +599,47 @@ impl Sim {
         if slot as usize >= inventory::HOTBAR {
             return;
         }
+        let tick = self.tick;
         let Some(p) = self.players.get_mut(&id) else {
             return;
         };
         p.held_slot = slot;
-        self.broadcast_held_item(id);
+        // Anti-amplification: a SelectSlot flood coalesces to one broadcast
+        // per HELD_ITEM_BROADCAST_MIN_TICKS; the trailing selection is
+        // flushed by `flush_held_item_broadcasts` when the window elapses.
+        if p.last_held_broadcast_tick
+            .is_none_or(|t| tick.saturating_sub(t) >= HELD_ITEM_BROADCAST_MIN_TICKS)
+        {
+            p.last_held_broadcast_tick = Some(tick);
+            p.held_broadcast_dirty = false;
+            self.broadcast_held_item(id);
+        } else {
+            p.held_broadcast_dirty = true;
+        }
+    }
+
+    /// Sends the deferred (coalesced) selection broadcasts whose window
+    /// elapsed this tick — so a slot-spamming client ends up announcing its
+    /// final selection, just rate-capped.
+    fn flush_held_item_broadcasts(&mut self) {
+        let tick = self.tick;
+        let due: Vec<u32> = self
+            .players
+            .iter()
+            .filter(|(_, p)| {
+                p.held_broadcast_dirty
+                    && p.last_held_broadcast_tick
+                        .is_none_or(|t| tick.saturating_sub(t) >= HELD_ITEM_BROADCAST_MIN_TICKS)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in due {
+            if let Some(p) = self.players.get_mut(&id) {
+                p.held_broadcast_dirty = false;
+                p.last_held_broadcast_tick = Some(tick);
+            }
+            self.broadcast_held_item(id);
+        }
     }
 
     /// Re-announces what `id` is holding (slot selection, or the held stack
@@ -639,6 +700,7 @@ impl Sim {
 
     /// Wakes the systems watching a changed cell: re-marks the fluid
     /// neighborhood, queues sand-fall checks (this cell and the one above),
+    /// queues §2 support re-validation for the neighborhood's fixtures,
     /// refreshes puddle tracking, and clears stale mining damage.
     pub(crate) fn wake_cell(&mut self, x: u32, y: u32) {
         self.tile_damage.remove(&(x, y, false));
@@ -655,9 +717,27 @@ impl Sim {
                 self.sand_active.insert((sx, sy));
             }
         }
+        self.queue_support_checks(x, y);
         self.track_puddle(x, y);
         self.track_puddle(x, y.wrapping_sub(1));
         self.track_puddle(x, y + 1);
+    }
+
+    /// Queues the changed cell and its cardinal neighbors for §2 fixture
+    /// support re-validation (torch attachment, furniture floors, door
+    /// frames — see `Sim::revalidate_supports`).
+    pub(crate) fn queue_support_checks(&mut self, x: u32, y: u32) {
+        for (cx, cy) in [
+            (x, y),
+            (x.wrapping_sub(1), y),
+            (x + 1, y),
+            (x, y.wrapping_sub(1)),
+            (x, y + 1),
+        ] {
+            if self.world.in_bounds(cx, cy) {
+                self.support_checks.push((cx, cy));
+            }
+        }
     }
 
     /// Sends the accumulated batched cell changes as one `TilesChanged` per
@@ -1348,6 +1428,44 @@ mod tests {
         msg(&mut sim, b, b_epoch, ClientMessage::SelectSlot { slot: 10 });
         assert_eq!(sim.players[&b].held_slot, 1);
         drain(&mut rx_b);
+    }
+
+    #[test]
+    fn select_slot_floods_coalesce_to_rate_capped_broadcasts() {
+        let mut sim = test_sim();
+        let (b, b_epoch, _rx_b) = join(&mut sim, "bob", None);
+        let (_a, _, mut rx_a) = join(&mut sim, "alice", None);
+        drain(&mut rx_a);
+        // 8 selections within one tick: a hostile client could otherwise
+        // amplify each into a PlayerHeldItem broadcast at socket speed.
+        for slot in [1u8, 2, 3, 4, 5, 4, 3, 2] {
+            msg(&mut sim, b, b_epoch, ClientMessage::SelectSlot { slot });
+        }
+        let held: Vec<u8> = drain(&mut rx_a)
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMessage::PlayerHeldItem { id, slot, .. } if id == b => Some(slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held, vec![1], "only the first broadcast immediately");
+        assert_eq!(
+            sim.players[&b].held_slot, 2,
+            "server state still tracks the final selection"
+        );
+        // The trailing selection flushes once the window elapses — remote
+        // clients converge on what the spammer ends up holding.
+        for _ in 0..HELD_ITEM_BROADCAST_MIN_TICKS {
+            sim.tick();
+        }
+        let held: Vec<u8> = drain(&mut rx_a)
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMessage::PlayerHeldItem { id, slot, .. } if id == b => Some(slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held, vec![2], "trailing selection flushed exactly once");
     }
 
     #[test]
