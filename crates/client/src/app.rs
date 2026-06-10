@@ -6,11 +6,15 @@ use std::collections::HashMap;
 
 use macroquad::prelude::*;
 
+use ferraria_shared::items::{inventory, InvSlot};
 use ferraria_shared::physics::PlayerInput;
 use ferraria_shared::protocol::{AuthToken, ClientMessage, ServerMessage};
 use ferraria_shared::world::{WorldFlags, DAY_TICKS};
 use ferraria_shared::{MAX_NAME_CHARS, PROTOCOL_VERSION, TICK_RATE, TILE_SIZE};
 
+use crate::entities::Entities;
+use crate::hotbar;
+use crate::interact::Interact;
 use crate::net::{WsClient, WsStatus};
 use crate::player::{OwnPlayer, RemotePlayer, Snapshot, CORRECTION_SNAP_TILES, INTERP_DELAY};
 use crate::render::{self, Camera, PlayerDraw};
@@ -243,6 +247,12 @@ struct Session {
     camera: Camera,
     chat: Chat,
     hud: Hud,
+    /// Server-authoritative inventory mirror (flat §8 layout).
+    inventory: Vec<Option<InvSlot>>,
+    /// Selected hotbar slot (0–9); the server learns via `SelectSlot`.
+    selected: u8,
+    interact: Interact,
+    entities: Entities,
     /// World progress flags, mirrored for later UI (bosses defeated...).
     #[allow(dead_code)]
     flags: WorldFlags,
@@ -270,6 +280,10 @@ impl Session {
             camera,
             chat: Chat::new(),
             hud: Hud::new(),
+            inventory: vec![None; inventory::TOTAL],
+            selected: 0,
+            interact: Interact::new(),
+            entities: Entities::new(),
             flags: welcome.flags,
         }
     }
@@ -317,11 +331,34 @@ impl Session {
             dt,
         );
 
+        // 4.5. Mouse world interaction (mining/placing/doors) and hotbar
+        // selection, with the fresh camera. Chat owns the keyboard while
+        // open, so hotbar keys stay quiet then.
+        let tl = self.camera.top_left();
+        let aim = Interact::aim(self.view.world(), tl);
+        if !self.chat.open {
+            if hotbar::selection_input(&mut self.selected) {
+                self.ws.send(&ClientMessage::SelectSlot {
+                    slot: self.selected,
+                });
+            }
+            self.interact.frame(
+                &self.ws,
+                self.view.world(),
+                center,
+                &self.inventory,
+                self.selected,
+                aim,
+                dt,
+            );
+        }
+
         // 5. Draw.
         clear_background(render::sky_color(self.clock.ticks()));
         render::draw_world(&self.view, &self.camera);
-        let tl = self.camera.top_left();
         let render_t = now - INTERP_DELAY;
+        self.interact.draw_cracks(now, tl);
+        self.entities.draw(render_t, now, tl);
         for remote in self.remotes.values_mut() {
             let s = remote.sample(render_t);
             render::draw_player(&PlayerDraw {
@@ -344,12 +381,19 @@ impl Session {
             anim: self.own.anim_flags(),
             name: &self.name,
             is_self: true,
-            held_item: None,
+            held_item: self
+                .inventory
+                .get(self.selected as usize)
+                .copied()
+                .flatten()
+                .map(|s| s.item),
         });
+        self.interact.draw_aim(aim, center, tl);
 
         // 6. Overlay UI.
         self.hud
             .draw(self.remotes.len() + 1, self.clock.day, self.clock.ticks());
+        hotbar::draw(&self.inventory, self.selected);
         self.chat.draw(now);
         if self.hud.debug {
             self.hud.draw_debug(
@@ -371,7 +415,41 @@ impl Session {
                     warn!("dropping bad chunk ({cx},{cy}): {e}");
                 }
             }
-            ServerMessage::TileChanged { x, y, tile } => self.view.apply_tile(x, y, tile),
+            ServerMessage::TileChanged { x, y, tile } => {
+                self.view.apply_tile(x, y, tile);
+                self.interact.on_tile_changed(x, y);
+            }
+            ServerMessage::TilesChanged { changes } => {
+                for (x, y, tile) in changes {
+                    self.view.apply_tile(x, y, tile);
+                    self.interact.on_tile_changed(x, y);
+                }
+            }
+            ServerMessage::BlockCrack { x, y, damage_frac } => {
+                self.interact.on_block_crack(x, y, damage_frac, now);
+            }
+            ServerMessage::InventorySync { slots } => {
+                self.inventory = slots;
+                self.inventory.resize(inventory::TOTAL, None);
+            }
+            ServerMessage::SlotChanged { idx, stack } => {
+                if let Some(slot) = self.inventory.get_mut(idx as usize) {
+                    *slot = stack;
+                }
+            }
+            ServerMessage::ItemDropSpawn {
+                id,
+                item,
+                count,
+                pos,
+                vel,
+            } => self.entities.spawn_item(id, item, count, pos, vel, now),
+            ServerMessage::EntitySpawn {
+                id, kind, pos, vel, ..
+            } => self.entities.spawn_other(id, kind, pos, vel, now),
+            ServerMessage::EntityUpdate { entities } => self.entities.update(&entities, now),
+            ServerMessage::EntityDespawn { id, .. } => self.entities.remove(id),
+            ServerMessage::ItemPickedUp { id, .. } => self.entities.remove(id),
             ServerMessage::PlayerJoined { id, name, pos } => {
                 if id != self.own_id {
                     self.chat.push_system(format!("{name} joined"), now);

@@ -353,8 +353,9 @@ mod tests {
                 _ => None,
             })
             .expect("fluid batch broadcast");
-        assert!(batch.iter().any(|&(bx, by, t)| (bx, by) == (x, y + 1)
-            && t.liquid.kind() == Some(LiquidKind::Water)));
+        assert!(batch.iter().any(
+            |&(bx, by, t)| (bx, by) == (x, y + 1) && t.liquid.kind() == Some(LiquidKind::Water)
+        ));
         assert_eq!(sim.world().tile(x, y).liquid.level(), 0);
         assert_eq!(sim.world().tile(x, y + 1).liquid.level(), 8);
 
@@ -391,7 +392,11 @@ mod tests {
         advance(&mut sim, 1);
         assert_eq!(sim.world().tile(x, shelf).id, TileId::Sand, "fell 1");
         assert_eq!(sim.world().tile(x, shelf - 1).id, TileId::Sand);
-        assert_eq!(sim.world().tile(x, shelf - 3).id, TileId::Air, "top vacated");
+        assert_eq!(
+            sim.world().tile(x, shelf - 3).id,
+            TileId::Air,
+            "top vacated"
+        );
         assert!(
             drain(&mut rx)
                 .iter()

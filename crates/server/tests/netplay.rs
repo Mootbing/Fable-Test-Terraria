@@ -337,7 +337,13 @@ async fn mine_drop_and_pickup_over_websocket() {
                     assert_eq!(tile.id, ferraria_shared::tiles::TileId::Air);
                     broke = true;
                 }
-                ServerMessage::ItemDropSpawn { id, item, count, pos, .. } => {
+                ServerMessage::ItemDropSpawn {
+                    id,
+                    item,
+                    count,
+                    pos,
+                    ..
+                } => {
                     assert!(count >= 1);
                     assert!(
                         (pos.0 - tx as f32).abs() < 2.0 && (pos.1 - ty as f32).abs() < 2.0,
@@ -360,9 +366,7 @@ async fn mine_drop_and_pickup_over_websocket() {
     // auto-collects the drop into our inventory. The owner's SlotChanged is
     // queued just before the ItemPickedUp broadcast.
     let stack = expect(&mut ws, "SlotChanged", |m| match m {
-        ServerMessage::SlotChanged {
-            stack: Some(s), ..
-        } if s.item == drop_item => Some(s),
+        ServerMessage::SlotChanged { stack: Some(s), .. } if s.item == drop_item => Some(s),
         _ => None,
     })
     .await;

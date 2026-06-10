@@ -622,7 +622,8 @@ impl Sim {
             return;
         }
         self.world.set_tile(x, y, tile);
-        self.chunk_cache.remove(&((x / CHUNK_SIZE), (y / CHUNK_SIZE)));
+        self.chunk_cache
+            .remove(&((x / CHUNK_SIZE), (y / CHUNK_SIZE)));
         self.broadcast_at(x, y, &ServerMessage::TileChanged { x, y, tile });
         self.wake_cell(x, y);
     }
@@ -631,7 +632,8 @@ impl Sim {
     /// already be written; this invalidates the chunk cache and queues the
     /// cell for the end-of-tick [`ServerMessage::TilesChanged`] flush.
     pub(crate) fn stage_tile(&mut self, x: u32, y: u32) {
-        self.chunk_cache.remove(&((x / CHUNK_SIZE), (y / CHUNK_SIZE)));
+        self.chunk_cache
+            .remove(&((x / CHUNK_SIZE), (y / CHUNK_SIZE)));
         self.tile_batch.push((x, y));
     }
 

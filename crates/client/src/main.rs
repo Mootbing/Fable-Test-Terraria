@@ -6,10 +6,16 @@
 //!   the live `Session`.
 //! - [`world_view`] — mirror of the server world (chunks + tile deltas).
 //! - [`player`] — own-player prediction, remote-player interpolation.
+//! - [`entities`] — mirror of server entities (item drops, later enemies).
+//! - [`interact`] — mouse aiming, mining/placing intents, crack overlay.
+//! - [`hotbar`] — hotbar selection + strip rendering.
 //! - [`render`] — camera, sky, tiles, player sprites.
 //! - [`ui`] — menus, HUD, chat, debug overlay.
 
 mod app;
+mod entities;
+mod hotbar;
+mod interact;
 mod net;
 mod player;
 mod render;

@@ -123,6 +123,19 @@ fn spawn_message(id: u32, e: &Entity) -> ServerMessage {
     }
 }
 
+/// A flattened item-drop snapshot used by the merge/pickup passes (borrowing
+/// the store while mutating players/broadcasts is not possible).
+#[derive(Debug, Clone, Copy)]
+struct DropView {
+    id: u32,
+    item: ItemId,
+    count: u16,
+    center: (f32, f32),
+    vel: (f32, f32),
+    spawn_tick: u64,
+    awake: bool,
+}
+
 /// Distance from a point to an AABB (0 inside) — the "player within 1.5
 /// tiles" pickup test measures from the item center to the player's hitbox.
 fn aabb_point_distance(pos: (f32, f32), size: (f32, f32), point: (f32, f32)) -> f32 {
@@ -213,17 +226,25 @@ impl Sim {
     /// (respecting `max_stack`), implemented as despawn-both + fresh spawn
     /// so every client renders the exact merged count.
     fn merge_item_drops(&mut self) {
-        let drops: Vec<(u32, ItemId, u16, (f32, f32), (f32, f32), u64, bool)> = self
+        let drops: Vec<DropView> = self
             .entities
             .map
             .iter()
             .map(|(&id, e)| {
                 let EntityKind::ItemDrop { item, count } = e.kind;
-                (id, item, count, e.center(), e.vel, e.spawn_tick, e.awake)
+                DropView {
+                    id,
+                    item,
+                    count,
+                    center: e.center(),
+                    vel: e.vel,
+                    spawn_tick: e.spawn_tick,
+                    awake: e.awake,
+                }
             })
             .collect();
         let mut consumed = vec![false; drops.len()];
-        let mut merges = Vec::new();
+        let mut merges: Vec<(u32, u32, DropView)> = Vec::new();
         for i in 0..drops.len() {
             if consumed[i] {
                 continue;
@@ -232,29 +253,43 @@ impl Sim {
                 if consumed[j] {
                     continue;
                 }
-                let (a, b) = (&drops[i], &drops[j]);
+                let (a, b) = (drops[i], drops[j]);
                 // Only consider pairs where something moved this tick, so a
                 // settled field of drops costs nothing.
-                if !(a.6 || b.6) || a.1 != b.1 {
+                if !(a.awake || b.awake) || a.item != b.item {
                     continue;
                 }
-                let total = a.2 as u32 + b.2 as u32;
-                if total > a.1.max_stack() as u32 {
+                let total = a.count as u32 + b.count as u32;
+                if total > a.item.max_stack() as u32 {
                     continue;
                 }
-                let (dx, dy) = (a.3 .0 - b.3 .0, a.3 .1 - b.3 .1);
+                let (dx, dy) = (a.center.0 - b.center.0, a.center.1 - b.center.1);
                 if dx * dx + dy * dy <= ITEM_MERGE_RADIUS * ITEM_MERGE_RADIUS {
                     consumed[i] = true;
                     consumed[j] = true;
-                    merges.push((a.0, b.0, a.1, total as u16, a.3, a.4, a.5.min(b.5)));
+                    merges.push((
+                        a.id,
+                        b.id,
+                        DropView {
+                            count: total as u16,
+                            spawn_tick: a.spawn_tick.min(b.spawn_tick),
+                            ..a
+                        },
+                    ));
                     break;
                 }
             }
         }
-        for (id_a, id_b, item, count, center, vel, spawn_tick) in merges {
+        for (id_a, id_b, merged) in merges {
             self.despawn_entity(id_a, DespawnReason::Despawned);
             self.despawn_entity(id_b, DespawnReason::Despawned);
-            self.spawn_item_drop_exact(item, count, center, vel, spawn_tick);
+            self.spawn_item_drop_exact(
+                merged.item,
+                merged.count,
+                merged.center,
+                merged.vel,
+                merged.spawn_tick,
+            );
         }
     }
 
@@ -263,17 +298,33 @@ impl Sim {
     /// wins (§11); a partial fit re-spawns the remainder.
     fn pickup_item_drops(&mut self) {
         let arm_ticks = (ITEM_PICKUP_ARM_SECS * TICK_RATE as f32) as u64;
-        let candidates: Vec<(u32, ItemId, u16, (f32, f32), u64)> = self
+        let candidates: Vec<DropView> = self
             .entities
             .map
             .iter()
             .filter(|(_, e)| self.tick.saturating_sub(e.spawn_tick) >= arm_ticks)
             .map(|(&id, e)| {
                 let EntityKind::ItemDrop { item, count } = e.kind;
-                (id, item, count, e.center(), e.spawn_tick)
+                DropView {
+                    id,
+                    item,
+                    count,
+                    center: e.center(),
+                    vel: e.vel,
+                    spawn_tick: e.spawn_tick,
+                    awake: e.awake,
+                }
             })
             .collect();
-        for (entity_id, item, count, center, spawn_tick) in candidates {
+        for DropView {
+            id: entity_id,
+            item,
+            count,
+            center,
+            spawn_tick,
+            ..
+        } in candidates
+        {
             // Nearest player in range, ties broken by id for determinism.
             let mut best: Option<(f32, u32)> = None;
             for (&pid, p) in &self.players {
@@ -369,10 +420,7 @@ impl Sim {
 fn touches_liquid(world: &ferraria_shared::world::World, e: &Entity, kind: LiquidKind) -> bool {
     let (w, h) = e.size();
     let (x0, y0) = (e.pos.0.floor() as i32, e.pos.1.floor() as i32);
-    let (x1, y1) = (
-        (e.pos.0 + w).floor() as i32,
-        (e.pos.1 + h).floor() as i32,
-    );
+    let (x1, y1) = ((e.pos.0 + w).floor() as i32, (e.pos.1 + h).floor() as i32);
     for y in y0..=y1 {
         for x in x0..=x1 {
             if world.liquid(x, y).kind() == Some(kind) {
@@ -484,7 +532,10 @@ mod tests {
             .map
             .values()
             .map(|e| match e.kind {
-                EntityKind::ItemDrop { item: ItemId::Stone, count } => count as u32,
+                EntityKind::ItemDrop {
+                    item: ItemId::Stone,
+                    count,
+                } => count as u32,
                 _ => 0,
             })
             .sum();
@@ -495,28 +546,13 @@ mod tests {
     #[test]
     fn nearby_same_item_drops_merge() {
         let mut sim = flat_sim(100, 60, FLOOR);
-        let a = sim.spawn_item_drop_exact(
-            ItemId::Wood,
-            10,
-            (60.5, FLOOR as f32 - 0.5),
-            (0.0, 0.0),
-            0,
-        );
-        let b = sim.spawn_item_drop_exact(
-            ItemId::Wood,
-            7,
-            (61.0, FLOOR as f32 - 0.5),
-            (0.0, 0.0),
-            0,
-        );
+        let a =
+            sim.spawn_item_drop_exact(ItemId::Wood, 10, (60.5, FLOOR as f32 - 0.5), (0.0, 0.0), 0);
+        let b =
+            sim.spawn_item_drop_exact(ItemId::Wood, 7, (61.0, FLOOR as f32 - 0.5), (0.0, 0.0), 0);
         // Different item nearby must not merge in.
-        let c = sim.spawn_item_drop_exact(
-            ItemId::Gel,
-            1,
-            (60.7, FLOOR as f32 - 0.5),
-            (0.0, 0.0),
-            0,
-        );
+        let c =
+            sim.spawn_item_drop_exact(ItemId::Gel, 1, (60.7, FLOOR as f32 - 0.5), (0.0, 0.0), 0);
         advance(&mut sim, 3);
         assert!(!sim.entities.map.contains_key(&a));
         assert!(!sim.entities.map.contains_key(&b));
@@ -526,7 +562,10 @@ mod tests {
             .map
             .values()
             .filter_map(|e| match e.kind {
-                EntityKind::ItemDrop { item: ItemId::Wood, count } => Some(count),
+                EntityKind::ItemDrop {
+                    item: ItemId::Wood,
+                    count,
+                } => Some(count),
                 _ => None,
             })
             .collect();
@@ -564,13 +603,8 @@ mod tests {
     #[test]
     fn drops_despawn_after_ten_minutes() {
         let mut sim = flat_sim(100, 60, FLOOR);
-        let eid = sim.spawn_item_drop_exact(
-            ItemId::Wood,
-            1,
-            (60.5, FLOOR as f32 - 0.5),
-            (0.0, 0.0),
-            0,
-        );
+        let eid =
+            sim.spawn_item_drop_exact(ItemId::Wood, 1, (60.5, FLOOR as f32 - 0.5), (0.0, 0.0), 0);
         sim.tick = (ITEM_DESPAWN_SECS * TICK_RATE as f32) as u64 - 2;
         advance(&mut sim, 1);
         assert!(sim.entities.map.contains_key(&eid), "one tick early");
@@ -595,10 +629,7 @@ mod tests {
             .spawn_messages_in_chunk(((150 / 64), (70 / 64)));
         assert!(replay.iter().any(|m| matches!(m,
             ServerMessage::ItemDropSpawn { id, .. } if *id == inside)));
-        assert!(sim
-            .entities
-            .spawn_messages_in_chunk((0, 0))
-            .is_empty());
+        assert!(sim.entities.spawn_messages_in_chunk((0, 0)).is_empty());
     }
 
     #[test]
