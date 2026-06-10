@@ -9,8 +9,10 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use ferraria_shared::items::{inventory, InvSlot, STARTING_KIT};
+use ferraria_shared::items::{inventory, InvSlot, ItemId, STARTING_KIT};
 use ferraria_shared::protocol::{decode, encode, ClientMessage, ServerMessage};
+use ferraria_shared::tiles::TileId;
+use ferraria_shared::world::CHEST_SLOTS;
 use ferraria_shared::{CHAT_MAX_CHARS, PROTOCOL_VERSION};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -22,8 +24,17 @@ const TEST_WORLD: (u64, u32, u32) = (7, 300, 300);
 
 /// Boots a server on an ephemeral port; returns the port.
 async fn start_server() -> u16 {
+    start_server_with(|_| {}).await
+}
+
+/// Boots a server whose generated world is first adjusted by `prepare`
+/// (placing test furniture, filling chests, ...).
+async fn start_server_with(
+    prepare: impl FnOnce(&mut ferraria_shared::world::World),
+) -> u16 {
     let (seed, w, h) = TEST_WORLD;
-    let world = ferraria_server::worldgen::generate_with_size(seed, w, h);
+    let mut world = ferraria_server::worldgen::generate_with_size(seed, w, h);
+    prepare(&mut world);
     let app = ferraria_server::net::router(world, seed, "web");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -377,6 +388,114 @@ async fn mine_drop_and_pickup_over_websocket() {
     })
     .await;
     assert_eq!(picked_by, player_id, "we collected our own drop");
+}
+
+/// End-to-end inventory/chest/craft flow: a chest near spawn is locked to
+/// its opener (second client gets `ChestDenied`), chest→inventory moves and
+/// a websocket `Craft` mutate the inventory through observed `SlotChanged`
+/// deltas, and closing hands the chest over.
+#[tokio::test]
+async fn chest_lock_and_crafting_over_websocket() {
+    // Stock a chest near the world spawn with the wood the craft will use.
+    let mut chest_pos = (0u32, 0u32);
+    let port = start_server_with(|world| {
+        let (sx, sy) = world.spawn;
+        // Keep candidates within REACH (6) of the spawn-standing player.
+        let mut placed = None;
+        'search: for dx in 2..5u32 {
+            for dy in 1..4u32 {
+                let (x, y) = (sx + dx, sy.saturating_sub(dy));
+                if world.place_multitile(x, y, TileId::Chest) {
+                    placed = Some((x, y));
+                    break 'search;
+                }
+            }
+        }
+        let (x, y) = placed.expect("a free 2x2 spot near spawn for the chest");
+        let mut slots = vec![None; CHEST_SLOTS];
+        slots[0] = Some(InvSlot::new(ItemId::Wood, 10));
+        world.chests.insert((x, y), slots);
+        chest_pos = (x, y);
+    })
+    .await;
+    let (cx, cy) = chest_pos;
+
+    let mut a = connect(port).await;
+    let _ = join(&mut a, "alice").await;
+    let mut b = connect(port).await;
+    let _ = join(&mut b, "bob").await;
+
+    // ---- Alice opens the chest and sees the stocked wood. -------------------
+    send(&mut a, &ClientMessage::OpenChest { x: cx, y: cy }).await;
+    let slots = expect(&mut a, "ChestContents", |m| match m {
+        ServerMessage::ChestContents { x, y, slots } if (x, y) == (cx, cy) => Some(slots),
+        _ => None,
+    })
+    .await;
+    assert_eq!(slots.len(), CHEST_SLOTS);
+    assert_eq!(slots[0], Some(InvSlot::new(ItemId::Wood, 10)));
+
+    // ---- Bob is denied while Alice holds it open. ----------------------------
+    send(&mut b, &ClientMessage::OpenChest { x: cx, y: cy }).await;
+    expect(&mut b, "ChestDenied", |m| match m {
+        ServerMessage::ChestDenied => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // ---- Alice withdraws the wood: both sides' deltas observed. --------------
+    send(
+        &mut a,
+        &ClientMessage::ChestMoveSlot {
+            chest_slot: 0,
+            inv_slot: 4,
+            to_chest: false,
+        },
+    )
+    .await;
+    let (mut got_inv, mut got_chest) = (false, false);
+    while !(got_inv && got_chest) {
+        match recv(&mut a).await {
+            ServerMessage::SlotChanged { idx: 4, stack } => {
+                assert_eq!(stack, Some(InvSlot::new(ItemId::Wood, 10)));
+                got_inv = true;
+            }
+            ServerMessage::ChestSlotChanged { idx: 0, stack } => {
+                assert_eq!(stack, None);
+                got_chest = true;
+            }
+            _ => {}
+        }
+    }
+
+    // ---- Craft a workbench (recipe 1, Hands): 10 wood -> 1 workbench. --------
+    send(&mut a, &ClientMessage::Craft { recipe_id: 1 }).await;
+    let crafted = expect(&mut a, "SlotChanged for the craft", |m| match m {
+        ServerMessage::SlotChanged { idx: 4, stack } => Some(stack),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        crafted,
+        Some(InvSlot::new(ItemId::Workbench, 1)),
+        "wood consumed, workbench in its place"
+    );
+
+    // ---- Close: Bob can now take over the (emptied) chest. -------------------
+    send(&mut a, &ClientMessage::CloseChest).await;
+    send(&mut a, &ClientMessage::Ping { nonce: 1 }).await; // order barrier
+    expect(&mut a, "Pong", |m| match m {
+        ServerMessage::Pong { nonce: 1 } => Some(()),
+        _ => None,
+    })
+    .await;
+    send(&mut b, &ClientMessage::OpenChest { x: cx, y: cy }).await;
+    let slots = expect(&mut b, "ChestContents after takeover", |m| match m {
+        ServerMessage::ChestContents { x, y, slots } if (x, y) == (cx, cy) => Some(slots),
+        _ => None,
+    })
+    .await;
+    assert_eq!(slots[0], None, "alice took the wood");
 }
 
 #[tokio::test]
