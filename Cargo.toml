@@ -13,6 +13,13 @@ license = "MIT"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
+# Block compression for world chunks. No "frame" feature (pulls extra deps we
+# don't need); must stay wasm32-compatible (no getrandom, no C).
+lz4_flex = { version = "0.11", default-features = false, features = [
+    "std",
+    "safe-encode",
+    "safe-decode",
+] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs"] }
