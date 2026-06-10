@@ -9,8 +9,10 @@
 pub mod entities;
 pub mod fluids;
 pub mod game;
+pub mod housing;
 pub mod interact;
 mod inventory;
+pub mod npc;
 pub mod world_tick;
 
 /// Shared helpers for the sim test suites (driving a [`game::Sim`] without

@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use ferraria_shared::items::{add_to_inventory, ItemId};
 use ferraria_shared::physics::{hitbox, step_item_drop, ITEM_SPAWN_SPEED_X, ITEM_SPAWN_SPEED_Y};
-use ferraria_shared::protocol::{DespawnReason, EntityState, ServerMessage};
+use ferraria_shared::protocol::{DespawnReason, EntityState, NpcKind, ServerMessage};
 use ferraria_shared::tiles::LiquidKind;
 use ferraria_shared::world::CHUNK_SIZE;
 use ferraria_shared::{
@@ -39,6 +39,12 @@ pub enum EntityKind {
     /// An unsupported sand tile in flight (§2 tile 4), stepped by
     /// `Sim::step_falling_sand` and converted back to a tile on landing.
     FallingSand,
+    /// A town NPC (§7). Per-NPC state (HP, home, AI) lives in
+    /// `Sim::npcs`, keyed by this entity's id; the store carries the
+    /// shared pos/vel for snapshot batching and chunk visibility. NPCs
+    /// announce themselves via `ServerMessage::NpcList` (roster broadcast
+    /// to everyone), not per-chunk spawn messages.
+    Npc { kind: NpcKind },
 }
 
 /// One live entity. Positions are the AABB top-left in tile units, matching
@@ -52,6 +58,9 @@ pub struct Entity {
     pub spawn_tick: u64,
     /// Changed since the last snapshot batch; cleared after broadcasting.
     pub awake: bool,
+    /// Kind-specific wire state byte carried in `EntityState` snapshots
+    /// (NPCs: facing/walking animation bits; 0 for drops/sand).
+    pub state: u8,
 }
 
 impl Entity {
@@ -59,6 +68,7 @@ impl Entity {
         match self.kind {
             EntityKind::ItemDrop { .. } => hitbox::ITEM_DROP,
             EntityKind::FallingSand => hitbox::FALLING_TILE,
+            EntityKind::Npc { .. } => hitbox::PLAYER,
         }
     }
 
@@ -102,12 +112,13 @@ impl EntityStore {
     }
 
     /// Spawn messages for every entity currently inside chunk `c` — sent to
-    /// players whose window just gained that chunk.
+    /// players whose window just gained that chunk. NPCs are skipped: their
+    /// roster (`NpcList`) goes to everyone regardless of chunk.
     pub fn spawn_messages_in_chunk(&self, c: (u32, u32)) -> Vec<ServerMessage> {
         self.map
             .iter()
             .filter(|(_, e)| e.chunk() == c)
-            .map(|(&id, e)| spawn_message(id, e))
+            .filter_map(|(&id, e)| spawn_message(id, e))
             .collect()
     }
 }
@@ -118,22 +129,25 @@ impl Default for EntityStore {
     }
 }
 
-fn spawn_message(id: u32, e: &Entity) -> ServerMessage {
+/// The wire announcement for one entity; `None` for kinds that announce
+/// through another channel (NPCs → `NpcList`).
+fn spawn_message(id: u32, e: &Entity) -> Option<ServerMessage> {
     match e.kind {
-        EntityKind::ItemDrop { item, count } => ServerMessage::ItemDropSpawn {
+        EntityKind::ItemDrop { item, count } => Some(ServerMessage::ItemDropSpawn {
             id,
             item,
             count,
             pos: e.pos,
             vel: e.vel,
-        },
-        EntityKind::FallingSand => ServerMessage::EntitySpawn {
+        }),
+        EntityKind::FallingSand => Some(ServerMessage::EntitySpawn {
             id,
             kind: ferraria_shared::protocol::EntityKind::FallingSand,
             pos: e.pos,
             vel: e.vel,
             state: 0,
-        },
+        }),
+        EntityKind::Npc { .. } => None,
     }
 }
 
@@ -183,10 +197,12 @@ impl Sim {
             kind: EntityKind::FallingSand,
             spawn_tick: self.tick,
             awake: true,
+            state: 0,
         };
         let id = self.entities.insert(entity);
-        let msg = spawn_message(id, &entity);
-        self.broadcast_at(x, y, &msg);
+        if let Some(msg) = spawn_message(id, &entity) {
+            self.broadcast_at(x, y, &msg);
+        }
         id
     }
 
@@ -207,10 +223,12 @@ impl Sim {
             kind: EntityKind::ItemDrop { item, count },
             spawn_tick,
             awake: true,
+            state: 0,
         };
         let id = self.entities.insert(entity);
-        let msg = spawn_message(id, &entity);
-        self.broadcast_at(center.0.max(0.0) as u32, center.1.max(0.0) as u32, &msg);
+        if let Some(msg) = spawn_message(id, &entity) {
+            self.broadcast_at(center.0.max(0.0) as u32, center.1.max(0.0) as u32, &msg);
+        }
         id
     }
 
@@ -431,7 +449,7 @@ impl Sim {
                         pos: e.pos,
                         vel: e.vel,
                         hp: None,
-                        state: 0,
+                        state: e.state,
                     },
                 )
             })
@@ -690,8 +708,13 @@ mod tests {
         sim.spawn_item_drop_exact(ItemId::Wood, 1, (60.5, FLOOR as f32 - 0.5), (0.0, 0.0), 100);
         sim.spawn_item_drop_exact(ItemId::Wood, 1, (61.0, FLOOR as f32 - 0.5), (0.0, 0.0), 900);
         advance(&mut sim, 2);
-        let survivor = sim.entities.map.values().next().expect("merged survivor");
-        assert_eq!(sim.entities.map.len(), 1);
-        assert_eq!(survivor.spawn_tick, 100, "despawn timer not reset");
+        let drops: Vec<&Entity> = sim
+            .entities
+            .map
+            .values()
+            .filter(|e| matches!(e.kind, EntityKind::ItemDrop { .. }))
+            .collect();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].spawn_tick, 100, "despawn timer not reset");
     }
 }

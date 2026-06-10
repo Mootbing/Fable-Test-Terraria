@@ -33,13 +33,14 @@ use ferraria_shared::world::{
 };
 use ferraria_shared::{
     CHAT_MAX_CHARS, HELD_ITEM_BROADCAST_MIN_TICKS, MAX_NAME_CHARS, MAX_PLAYERS, MAX_PLAYER_SPEED,
-    MAX_TELEPORT_BUDGET_TILES, MAX_TELEPORT_PER_TICK, SNAPSHOT_INTERVAL_TICKS, TICK_RATE,
-    TIME_SYNC_INTERVAL_TICKS,
+    MAX_TELEPORT_BUDGET_TILES, MAX_TELEPORT_PER_TICK, PLAYER_BASE_MAX_HP, SNAPSHOT_INTERVAL_TICKS,
+    TICK_RATE, TIME_SYNC_INTERVAL_TICKS,
 };
 
 use super::entities::EntityStore;
 use super::fluids::FluidSim;
 use super::interact::TileDamage;
+use super::npc::{DebuffSet, TownState};
 
 /// One encoded `ServerMessage`, shared between sessions without re-encoding.
 pub type Frame = Arc<[u8]>;
@@ -132,6 +133,18 @@ pub(crate) struct Player {
     last_held_broadcast_tick: Option<u64>,
     /// A coalesced selection broadcast is pending for this player.
     held_broadcast_dirty: bool,
+    /// §8 health. INTEGRATE(player-hp): the enemies/combat branch owns
+    /// damage, death, regen, and Life Crystal max-HP gains; this branch
+    /// stores HP so the Nurse (§7.4), her arrival condition (§7.2), and the
+    /// HP-gated dialogue (§7.5) work. The merge train should unify on one
+    /// pair of fields.
+    pub(crate) hp: u32,
+    pub(crate) max_hp: u32,
+    /// Debuff storage (see [`DebuffSet`] — INTEGRATE(nurse-debuffs)).
+    pub(crate) debuffs: DebuffSet,
+    /// §8 personal bed spawn: the bed's origin tile, validated again at
+    /// respawn time (`Sim::spawn_point_for`).
+    pub(crate) bed_spawn: Option<(u32, u32)>,
     tx: mpsc::Sender<Frame>,
 }
 
@@ -161,6 +174,9 @@ struct OfflinePlayer {
     pos: (f32, f32),
     held_slot: u8,
     inventory: Vec<Option<InvSlot>>,
+    hp: u32,
+    max_hp: u32,
+    bed_spawn: Option<(u32, u32)>,
 }
 
 /// The authoritative game state, owned by [`run`]'s task. Fields are
@@ -209,6 +225,8 @@ pub struct Sim {
     /// Queued by [`Sim::queue_support_checks`], drained by
     /// `Sim::revalidate_supports` after every command and every tick.
     pub(crate) support_checks: Vec<(u32, u32)>,
+    /// Town NPC roster + arrival bookkeeping (§7, `sim::npc`).
+    pub(crate) town: TownState,
 }
 
 impl Sim {
@@ -235,8 +253,12 @@ impl Sim {
             loot_rng: Pcg32::new(entropy_seed() ^ 0x1007_caf3),
             tile_batch: Vec::new(),
             support_checks: Vec::new(),
+            town: TownState::default(),
         };
         sim.scan_initial_puddles();
+        // §7.2: the Sage is here from the start. NPC state isn't persisted
+        // yet, so every boot counts as "first world boot".
+        sim.init_npcs();
         sim
     }
 
@@ -306,11 +328,13 @@ impl Sim {
             }
         }
 
-        // Live world systems (fluids §3, sand/grass/saplings §2) and
-        // entities. Their batched cell changes flush as one `TilesChanged`
-        // per player at the end of the tick.
+        // Live world systems (fluids §3, sand/grass/saplings §2), entities,
+        // and town NPCs (§7: dawn events, hourly arrival checks, AI). Their
+        // batched cell changes flush as one `TilesChanged` per player at
+        // the end of the tick.
         self.world_tick();
         self.tick_entities();
+        self.tick_npcs();
         self.revalidate_supports();
 
         // Chest locks follow their openers: walking out of reach closes the
@@ -323,7 +347,7 @@ impl Sim {
             self.broadcast_entity_updates();
         }
 
-        // (Later PRs: enemies, NPCs tick here.)
+        // (Later PRs: enemies tick here.)
 
         self.flush_kicks();
     }
@@ -363,15 +387,33 @@ impl Sim {
             }
             None => None,
         };
-        let (id, token, pos, held_slot, inv) = match reclaimed {
-            Some(rec) => (rec.id, rec.token, rec.pos, rec.held_slot, rec.inventory),
+        let rec = match reclaimed {
+            Some(rec) => rec,
             None => {
                 let id = self.next_player_id;
                 self.next_player_id += 1;
-                let pos = spawn_pos(&self.world);
-                (id, self.fresh_token(), pos, 0, starting_inventory())
+                OfflinePlayer {
+                    id,
+                    token: self.fresh_token(),
+                    pos: spawn_pos(&self.world),
+                    held_slot: 0,
+                    inventory: starting_inventory(),
+                    hp: PLAYER_BASE_MAX_HP,
+                    max_hp: PLAYER_BASE_MAX_HP,
+                    bed_spawn: None,
+                }
             }
         };
+        let OfflinePlayer {
+            id,
+            token,
+            pos,
+            held_slot,
+            inventory: inv,
+            hp,
+            max_hp,
+            bed_spawn,
+        } = rec;
         let epoch = self.next_epoch;
         self.next_epoch += 1;
         let player = Player {
@@ -394,6 +436,12 @@ impl Sim {
             last_door_toggle_tick: None,
             last_held_broadcast_tick: None,
             held_broadcast_dirty: false,
+            hp,
+            max_hp,
+            // Debuffs don't survive a disconnect (they'd have ticked away
+            // offline anyway; INTEGRATE(nurse-debuffs)).
+            debuffs: DebuffSet::default(),
+            bed_spawn,
             tx,
         };
 
@@ -479,6 +527,19 @@ impl Sim {
         self.player_count
             .store(self.players.len(), Ordering::Relaxed);
         self.update_player_chunks(id);
+        // Town roster + own health, after the chunk stream (clients don't
+        // care about ordering; it keeps the join-state frame sequence that
+        // pre-NPC tests pin intact).
+        let roster = self.npc_list_message();
+        self.send_to(id, &roster);
+        self.send_to(
+            id,
+            &ServerMessage::PlayerHealth {
+                id,
+                hp: hp as u16,
+                max_hp: max_hp as u16,
+            },
+        );
         let _ = reply.send(Ok((id, epoch)));
         tracing::info!(player = id, name = %name, "player joined");
     }
@@ -507,6 +568,9 @@ impl Sim {
                 pos: p.pos,
                 held_slot: p.held_slot,
                 inventory: p.inventory,
+                hp: p.hp,
+                max_hp: p.max_hp,
+                bed_spawn: p.bed_spawn,
             },
         );
         self.player_count
@@ -571,6 +635,19 @@ impl Sim {
                 inv_slot,
                 to_chest,
             } => self.chest_move_slot(id, chest_slot, inv_slot, to_chest),
+            ClientMessage::TalkNpc { npc_id } => self.talk_npc(id, npc_id),
+            ClientMessage::BuyItem {
+                npc_id,
+                item,
+                count,
+            } => self.buy_item(id, npc_id, item, count),
+            ClientMessage::SellItem {
+                npc_id,
+                slot,
+                count,
+            } => self.sell_item(id, npc_id, slot, count),
+            ClientMessage::NurseHeal => self.nurse_heal(id),
+            ClientMessage::SetBedSpawn { x, y } => self.set_bed_spawn(id, x, y),
             other => {
                 tracing::debug!(player = id, msg = ?other, "intent not implemented yet");
             }
