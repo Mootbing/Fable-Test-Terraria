@@ -1,9 +1,15 @@
 //! 2D overlay UI: menu / connecting / disconnected screens, the in-game HUD
-//! (player count, clock, F3 debug), and chat.
+//! (player count, clock, F3 debug), chat, and the inventory screen
+//! ([`inventory`]: hotbar/backpack/equipment/chest panels; [`crafting`]:
+//! the crafting panel).
 //!
 //! Per-frame string allocation is avoided: the HUD caches its text and only
 //! reformats when the underlying value changes, chat lines are formatted
 //! once on arrival, and the debug overlay refreshes on a slow timer.
+//! (Tooltips allocate while hovering — one small panel at most.)
+
+pub mod crafting;
+pub mod inventory;
 
 use std::collections::VecDeque;
 

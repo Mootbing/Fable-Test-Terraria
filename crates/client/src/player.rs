@@ -5,7 +5,9 @@
 use std::collections::VecDeque;
 
 use ferraria_shared::items::ItemId;
-use ferraria_shared::physics::{step_player, PlayerInput, PlayerPhysics, StepResult};
+use ferraria_shared::physics::{
+    step_player_with_mods, PhysicsMods, PlayerInput, PlayerPhysics, StepResult,
+};
 use ferraria_shared::protocol::{anim, ClientMessage};
 use ferraria_shared::{DT, SNAPSHOT_INTERVAL_TICKS};
 
@@ -65,13 +67,16 @@ impl OwnPlayer {
     /// Advances the fixed-step simulation by one render frame, returning the
     /// `PlayerState` messages to send (one per 3rd sim tick, when changed).
     /// `frozen` skips stepping (chunk under us not loaded yet) without
-    /// banking time in the accumulator.
+    /// banking time in the accumulator. `mods` carries the equipment physics
+    /// modifiers from the synced inventory (`loadout::physics_mods`) so
+    /// prediction matches the server's expectations.
     pub fn update(
         &mut self,
         world: &ferraria_shared::world::World,
         input: PlayerInput,
         frame_dt: f32,
         frozen: bool,
+        mods: PhysicsMods,
     ) -> Vec<ClientMessage> {
         let mut out = Vec::new();
         if frozen {
@@ -84,7 +89,7 @@ impl OwnPlayer {
             if input.left != input.right {
                 self.facing = if input.right { 1 } else { -1 };
             }
-            self.last_step = step_player(world, &mut self.phys, input, DT);
+            self.last_step = step_player_with_mods(world, &mut self.phys, input, DT, mods);
             self.tick += 1;
             if self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS as u64) {
                 let state = ClientMessage::PlayerState {

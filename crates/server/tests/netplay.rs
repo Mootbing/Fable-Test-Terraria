@@ -29,9 +29,7 @@ async fn start_server() -> u16 {
 
 /// Boots a server whose generated world is first adjusted by `prepare`
 /// (placing test furniture, filling chests, ...).
-async fn start_server_with(
-    prepare: impl FnOnce(&mut ferraria_shared::world::World),
-) -> u16 {
+async fn start_server_with(prepare: impl FnOnce(&mut ferraria_shared::world::World)) -> u16 {
     let (seed, w, h) = TEST_WORLD;
     let mut world = ferraria_server::worldgen::generate_with_size(seed, w, h);
     prepare(&mut world);

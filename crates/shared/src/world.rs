@@ -245,6 +245,24 @@ impl World {
     }
 }
 
+/// Within mine/place reach (§8, [`crate::REACH`] = 6) of any cell of a
+/// chest's 2×2 footprint, measured player center → cell center. One rule,
+/// used by the server (open validation + walk-away lock release) and the
+/// client (walk-away panel close) so they always agree.
+pub fn chest_in_reach(center: (f32, f32), origin: (u32, u32)) -> bool {
+    let (w, h) = TileId::Chest.data().size;
+    for dy in 0..h as u32 {
+        for dx in 0..w as u32 {
+            let (cx, cy) = ((origin.0 + dx) as f32 + 0.5, (origin.1 + dy) as f32 + 0.5);
+            let (ddx, ddy) = (cx - center.0, cy - center.1);
+            if ddx * ddx + ddy * ddy <= crate::REACH * crate::REACH {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Errors from [`decode_chunk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkDecodeError {

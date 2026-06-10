@@ -9,8 +9,7 @@ use ferraria_shared::inventory_ops::{apply_slot_op, SlotAddr, SlotDelta, SlotOp}
 use ferraria_shared::items::{inventory, InvSlot};
 use ferraria_shared::protocol::ServerMessage;
 use ferraria_shared::tiles::TileId;
-use ferraria_shared::world::CHEST_SLOTS;
-use ferraria_shared::REACH;
+use ferraria_shared::world::{chest_in_reach, CHEST_SLOTS};
 
 use super::game::Sim;
 
@@ -56,14 +55,11 @@ impl Sim {
         // INTEGRATE(drop-entity): spawn a world item-drop entity for
         // (stack.item, count) at the player's feet here (ItemDropSpawn
         // broadcast + first-pickup-wins tracking) once the item-drop branch
-        // lands; until then dropping removes the items and says so.
+        // lands; until then dropping removes the items and tells everyone.
         self.send_slot_deltas(id, &[(SlotAddr::Inv(idx), new)]);
-        self.send_to(
-            id,
-            &ServerMessage::Toast {
-                text: format!("Dropped {count} {name}"),
-            },
-        );
+        self.broadcast(&ServerMessage::Toast {
+            text: format!("Dropped {count} {name}"),
+        });
     }
 
     // ---- Crafting (§4.4) -----------------------------------------------------
@@ -196,7 +192,13 @@ impl Sim {
 
     /// `ChestMoveSlot`: one validated op between the open chest and the
     /// inventory, through the same slot-op engine as `MoveSlot`.
-    pub(super) fn chest_move_slot(&mut self, id: u32, chest_slot: u8, inv_slot: u8, to_chest: bool) {
+    pub(super) fn chest_move_slot(
+        &mut self,
+        id: u32,
+        chest_slot: u8,
+        inv_slot: u8,
+        to_chest: bool,
+    ) {
         let Some(p) = self.players.get_mut(&id) else {
             return;
         };
@@ -222,7 +224,14 @@ impl Sim {
         match apply_slot_op(&mut p.inventory, Some(chest), SlotOp::Move, from, to) {
             Ok(deltas) => self.send_slot_deltas(id, &deltas),
             Err(e) => {
-                tracing::debug!(player = id, chest_slot, inv_slot, to_chest, ?e, "chest op rejected")
+                tracing::debug!(
+                    player = id,
+                    chest_slot,
+                    inv_slot,
+                    to_chest,
+                    ?e,
+                    "chest op rejected"
+                )
             }
         }
     }
@@ -272,26 +281,6 @@ impl Sim {
     }
 }
 
-/// Within mine/place reach (§8, `REACH` = 6) of any cell of the chest's 2×2
-/// footprint, measured player center → cell center. The client mirrors this
-/// exact rule for its walk-away close.
-pub fn chest_in_reach(center: (f32, f32), origin: (u32, u32)) -> bool {
-    let (w, h) = TileId::Chest.data().size;
-    for dy in 0..h as u32 {
-        for dx in 0..w as u32 {
-            let (cx, cy) = (
-                (origin.0 + dx) as f32 + 0.5,
-                (origin.1 + dy) as f32 + 0.5,
-            );
-            let (ddx, ddy) = (cx - center.0, cy - center.1);
-            if ddx * ddx + ddy * ddy <= REACH * REACH {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::game::testutil::*;
@@ -303,8 +292,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn give(sim: &mut Sim, id: u32, slot: usize, item: ItemId, count: u16) {
-        sim.players.get_mut(&id).expect("player").inventory[slot] =
-            Some(InvSlot::new(item, count));
+        sim.players.get_mut(&id).expect("player").inventory[slot] = Some(InvSlot::new(item, count));
     }
 
     fn slot(sim: &Sim, id: u32, idx: usize) -> Option<InvSlot> {
@@ -341,19 +329,39 @@ mod tests {
     fn move_and_split_emit_slot_deltas() {
         let (mut sim, id, epoch, mut rx) = sim_with_player();
         // Starting kit: sword in 0, torches ×5 in 3.
-        msg(&mut sim, id, epoch, ClientMessage::MoveSlot { from: 0, to: 15 });
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::MoveSlot { from: 0, to: 15 },
+        );
         let changes = slot_changes(&drain(&mut rx));
         assert!(changes.contains(&(0, None)));
         assert!(changes.contains(&(15, Some(InvSlot::new(ItemId::WoodSword, 1)))));
 
-        msg(&mut sim, id, epoch, ClientMessage::SplitSlot { from: 3, to: 20 });
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::SplitSlot { from: 3, to: 20 },
+        );
         let changes = slot_changes(&drain(&mut rx));
         assert!(changes.contains(&(3, Some(InvSlot::new(ItemId::Torch, 2)))));
         assert!(changes.contains(&(20, Some(InvSlot::new(ItemId::Torch, 3)))));
 
         // Garbage ops change nothing and answer nothing.
-        msg(&mut sim, id, epoch, ClientMessage::MoveSlot { from: 30, to: 31 });
-        msg(&mut sim, id, epoch, ClientMessage::MoveSlot { from: 0, to: 200 });
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::MoveSlot { from: 30, to: 31 },
+        );
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::MoveSlot { from: 0, to: 200 },
+        );
         assert!(drain(&mut rx).is_empty());
     }
 
@@ -366,8 +374,18 @@ mod tests {
 
         let head = inventory::ARMOR_START as u8;
         let acc = inventory::ACCESSORY_START as u8;
-        msg(&mut sim, id, epoch, ClientMessage::MoveSlot { from: 10, to: head });
-        msg(&mut sim, id, epoch, ClientMessage::MoveSlot { from: 11, to: acc });
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::MoveSlot { from: 10, to: head },
+        );
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::MoveSlot { from: 11, to: acc },
+        );
         let inv = sim.players[&id].inventory.clone();
         assert_eq!(loadout::defense(&inv), 2, "iron helmet equipped");
         assert_eq!(
@@ -377,11 +395,30 @@ mod tests {
         drain(&mut rx);
 
         // Duplicate accessory and wrong armor slot are rejected server-side.
-        msg(&mut sim, id, epoch, ClientMessage::MoveSlot { from: 12, to: acc + 1 });
-        assert_eq!(slot(&sim, id, 12), Some(InvSlot::new(ItemId::SwiftBoots, 1)));
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::MoveSlot {
+                from: 12,
+                to: acc + 1,
+            },
+        );
+        assert_eq!(
+            slot(&sim, id, 12),
+            Some(InvSlot::new(ItemId::SwiftBoots, 1))
+        );
         give(&mut sim, id, 13, ItemId::IronGreaves, 1);
-        msg(&mut sim, id, epoch, ClientMessage::MoveSlot { from: 13, to: head });
-        assert_eq!(slot(&sim, id, 13), Some(InvSlot::new(ItemId::IronGreaves, 1)));
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::MoveSlot { from: 13, to: head },
+        );
+        assert_eq!(
+            slot(&sim, id, 13),
+            Some(InvSlot::new(ItemId::IronGreaves, 1))
+        );
         assert!(drain(&mut rx).is_empty(), "rejections are silent");
 
         // Physics agrees with the loadout: a mid-air jump works only with
@@ -389,7 +426,15 @@ mod tests {
         let mods = loadout::physics_mods(&sim.players[&id].inventory);
         assert_eq!(mods.extra_air_jumps, 0);
         give(&mut sim, id, 14, ItemId::GustJar, 1);
-        msg(&mut sim, id, epoch, ClientMessage::MoveSlot { from: 14, to: acc + 1 });
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::MoveSlot {
+                from: 14,
+                to: acc + 1,
+            },
+        );
         let mods = loadout::physics_mods(&sim.players[&id].inventory);
         assert_eq!(
             mods,
@@ -409,7 +454,12 @@ mod tests {
         drain(&mut rx_a);
         drain(&mut rx_b);
         // Alice holds slot 0 (wood sword); moving it away empties her hand.
-        msg(&mut sim, a, a_epoch, ClientMessage::MoveSlot { from: 0, to: 9 });
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::MoveSlot { from: 0, to: 9 },
+        );
         let held = drain(&mut rx_b)
             .into_iter()
             .find_map(|m| match m {
@@ -502,10 +552,20 @@ mod tests {
         assert!(sim.world.place_multitile(cx, cy, TileId::Chest));
 
         // Opening a non-origin cell is rejected silently.
-        msg(&mut sim, a, a_epoch, ClientMessage::OpenChest { x: cx + 1, y: cy });
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::OpenChest { x: cx + 1, y: cy },
+        );
         assert!(drain(&mut rx_a).is_empty());
 
-        msg(&mut sim, a, a_epoch, ClientMessage::OpenChest { x: cx, y: cy });
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::OpenChest { x: cx, y: cy },
+        );
         let contents = drain(&mut rx_a);
         assert!(
             contents.iter().any(|m| matches!(m,
@@ -515,14 +575,24 @@ mod tests {
         );
 
         // Second player: denied while held open.
-        msg(&mut sim, b, b_epoch, ClientMessage::OpenChest { x: cx, y: cy });
+        msg(
+            &mut sim,
+            b,
+            b_epoch,
+            ClientMessage::OpenChest { x: cx, y: cy },
+        );
         assert!(drain(&mut rx_b)
             .iter()
             .any(|m| matches!(m, ServerMessage::ChestDenied)));
 
         // Takeover after close.
         msg(&mut sim, a, a_epoch, ClientMessage::CloseChest);
-        msg(&mut sim, b, b_epoch, ClientMessage::OpenChest { x: cx, y: cy });
+        msg(
+            &mut sim,
+            b,
+            b_epoch,
+            ClientMessage::OpenChest { x: cx, y: cy },
+        );
         assert!(drain(&mut rx_b)
             .iter()
             .any(|m| matches!(m, ServerMessage::ChestContents { .. })));
@@ -538,7 +608,12 @@ mod tests {
         let center = sim.players[&a].center();
         let (cx, cy) = (center.0 as u32 + 2, center.1 as u32);
         assert!(sim.world.place_multitile(cx, cy, TileId::Chest));
-        msg(&mut sim, a, a_epoch, ClientMessage::OpenChest { x: cx, y: cy });
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::OpenChest { x: cx, y: cy },
+        );
         drain(&mut rx_a);
 
         // Deposit the starting torches (slot 3) into chest slot 0.
@@ -584,7 +659,12 @@ mod tests {
         );
         sim.tick();
         assert!(sim.players[&a].open_chest.is_none(), "lock released");
-        msg(&mut sim, b, b_epoch, ClientMessage::OpenChest { x: cx, y: cy });
+        msg(
+            &mut sim,
+            b,
+            b_epoch,
+            ClientMessage::OpenChest { x: cx, y: cy },
+        );
         let torches = drain(&mut rx_b)
             .into_iter()
             .find_map(|m| match m {
@@ -620,13 +700,23 @@ mod tests {
         let center = sim.players[&a].center();
         let (cx, cy) = (center.0 as u32 + 2, center.1 as u32);
         assert!(sim.world.place_multitile(cx, cy, TileId::Chest));
-        msg(&mut sim, a, a_epoch, ClientMessage::OpenChest { x: cx, y: cy });
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::OpenChest { x: cx, y: cy },
+        );
         sim.handle(crate::sim::game::SimCommand::Disconnect {
             player_id: a,
             epoch: a_epoch,
         });
         assert!(sim.chest_locks.is_empty(), "disconnect freed the lock");
-        msg(&mut sim, b, b_epoch, ClientMessage::OpenChest { x: cx, y: cy });
+        msg(
+            &mut sim,
+            b,
+            b_epoch,
+            ClientMessage::OpenChest { x: cx, y: cy },
+        );
         assert!(drain(&mut rx_b)
             .iter()
             .any(|m| matches!(m, ServerMessage::ChestContents { .. })));
@@ -636,22 +726,47 @@ mod tests {
     fn drop_item_validates_slot_and_count() {
         let (mut sim, id, epoch, mut rx) = sim_with_player();
         // Bad counts: nothing happens.
-        msg(&mut sim, id, epoch, ClientMessage::DropItem { slot: 3, count: 0 });
-        msg(&mut sim, id, epoch, ClientMessage::DropItem { slot: 3, count: 6 });
-        msg(&mut sim, id, epoch, ClientMessage::DropItem { slot: 20, count: 1 });
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::DropItem { slot: 3, count: 0 },
+        );
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::DropItem { slot: 3, count: 6 },
+        );
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::DropItem { slot: 20, count: 1 },
+        );
         assert!(drain(&mut rx).is_empty());
         assert_eq!(slot(&sim, id, 3), Some(InvSlot::new(ItemId::Torch, 5)));
 
         // Valid drop removes the items and toasts.
-        msg(&mut sim, id, epoch, ClientMessage::DropItem { slot: 3, count: 2 });
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::DropItem { slot: 3, count: 2 },
+        );
         let msgs = drain(&mut rx);
         assert!(slot_changes(&msgs).contains(&(3, Some(InvSlot::new(ItemId::Torch, 3)))));
-        assert!(msgs
-            .iter()
-            .any(|m| matches!(m, ServerMessage::Toast { text } if text.contains("Dropped 2 Torch"))));
+        assert!(msgs.iter().any(
+            |m| matches!(m, ServerMessage::Toast { text } if text.contains("Dropped 2 Torch"))
+        ));
 
         // Dropping the whole stack empties the slot.
-        msg(&mut sim, id, epoch, ClientMessage::DropItem { slot: 3, count: 3 });
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::DropItem { slot: 3, count: 3 },
+        );
         assert_eq!(slot(&sim, id, 3), None);
     }
 
@@ -659,7 +774,10 @@ mod tests {
     fn chest_reach_rule() {
         // Any cell of the 2×2 footprint within REACH counts.
         assert!(chest_in_reach((10.0, 10.0), (12, 10)));
-        assert!(chest_in_reach((10.0, 10.0), (15, 10)), "far cell at 6.04, near at 5.5");
+        assert!(
+            chest_in_reach((10.0, 10.0), (15, 10)),
+            "far cell at 6.04, near at 5.5"
+        );
         assert!(!chest_in_reach((10.0, 10.0), (17, 10)));
         assert!(!chest_in_reach((10.0, 10.0), (12, 18)));
     }

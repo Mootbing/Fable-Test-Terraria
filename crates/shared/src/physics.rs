@@ -1061,7 +1061,10 @@ mod tests {
         for _ in 0..120 {
             step_player_with_mods(&world, &mut p, RIGHT, DT, mods);
         }
-        assert_eq!(p.vel.0, RUN_MAX_SPEED * crate::items::SWIFT_BOOTS_SPEED_MULT);
+        assert_eq!(
+            p.vel.0,
+            RUN_MAX_SPEED * crate::items::SWIFT_BOOTS_SPEED_MULT
+        );
         // And without mods the plain cap still holds.
         let mut q = PlayerPhysics::from_feet(5.0, 10.0);
         settle(&world, &mut q);

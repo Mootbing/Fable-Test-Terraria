@@ -535,7 +535,10 @@ mod tests {
         roundtrip_client(ClientMessage::WakeUp);
         roundtrip_client(ClientMessage::MoveSlot { from: 0, to: 56 });
         roundtrip_client(ClientMessage::SplitSlot { from: 9, to: 49 });
-        roundtrip_client(ClientMessage::DropItem { slot: 12, count: 999 });
+        roundtrip_client(ClientMessage::DropItem {
+            slot: 12,
+            count: 999,
+        });
         roundtrip_client(ClientMessage::OpenChest { x: 2100, y: 950 });
         roundtrip_client(ClientMessage::CloseChest);
     }

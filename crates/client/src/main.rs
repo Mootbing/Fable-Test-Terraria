@@ -8,14 +8,13 @@
 //! - [`player`] — own-player prediction, remote-player interpolation.
 //! - [`entities`] — mirror of server entities (item drops, later enemies).
 //! - [`interact`] — mouse aiming, mining/placing intents, crack overlay.
-//! - [`hotbar`] — hotbar selection + strip rendering.
 //! - [`light`] — client-side flood-fill lighting + day/night sky ramp.
 //! - [`render`] — camera, sky, tiles, player sprites.
-//! - [`ui`] — menus, HUD, chat, debug overlay.
+//! - [`ui`] — menus, HUD, chat, debug overlay (`ui::inventory`,
+//!   `ui::crafting`: hotbar + inventory screen, crafting panel).
 
 mod app;
 mod entities;
-mod hotbar;
 mod interact;
 mod light;
 mod net;

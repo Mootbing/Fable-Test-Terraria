@@ -265,10 +265,7 @@ fn plan_split(
         }
     }
     match dst {
-        None => Ok((
-            keep(src.count - half),
-            Some(InvSlot::new(src.item, half)),
-        )),
+        None => Ok((keep(src.count - half), Some(InvSlot::new(src.item, half)))),
         Some(d) if d.item == src.item => {
             let space = src.item.max_stack().saturating_sub(d.count);
             if space == 0 {
@@ -413,23 +410,20 @@ mod tests {
 
         // Non-armor can't be equipped at all.
         let mut inv = inv_with(&[(0, ItemId::Dirt, 10)]);
-        assert_eq!(
-            mv(&mut inv, 0, ARMOR_START),
-            Err(SlotOpError::Incompatible)
-        );
+        assert_eq!(mv(&mut inv, 0, ARMOR_START), Err(SlotOpError::Incompatible));
 
         // Swapping helmets through the head slot works both ways.
-        let mut inv = inv_with(&[(0, ItemId::IronHelmet, 1), (ARMOR_START, ItemId::GoldHelmet, 1)]);
+        let mut inv = inv_with(&[
+            (0, ItemId::IronHelmet, 1),
+            (ARMOR_START, ItemId::GoldHelmet, 1),
+        ]);
         mv(&mut inv, 0, ARMOR_START).expect("swap helmets");
         assert_eq!(inv[0], Some(InvSlot::new(ItemId::GoldHelmet, 1)));
         assert_eq!(inv[ARMOR_START], Some(InvSlot::new(ItemId::IronHelmet, 1)));
 
         // Swap that would put a non-armor item into the armor slot fails.
         let mut inv = inv_with(&[(ARMOR_START, ItemId::GoldHelmet, 1), (0, ItemId::Dirt, 5)]);
-        assert_eq!(
-            mv(&mut inv, 0, ARMOR_START),
-            Err(SlotOpError::Incompatible)
-        );
+        assert_eq!(mv(&mut inv, 0, ARMOR_START), Err(SlotOpError::Incompatible));
     }
 
     #[test]
@@ -466,7 +460,11 @@ mod tests {
         let mut inv = inv_with(&[(0, ItemId::Dirt, 99), (TRASH, ItemId::GoldBar, 5)]);
         mv(&mut inv, 0, TRASH).expect("trash it");
         assert_eq!(inv[0], None);
-        assert_eq!(inv[TRASH], Some(InvSlot::new(ItemId::Dirt, 99)), "old trash destroyed");
+        assert_eq!(
+            inv[TRASH],
+            Some(InvSlot::new(ItemId::Dirt, 99)),
+            "old trash destroyed"
+        );
 
         // Items can be taken back out of the trash before it's overwritten.
         mv(&mut inv, TRASH, 3).expect("retrieve");
@@ -537,10 +535,16 @@ mod tests {
         slots[3] = Some(InvSlot::new(ItemId::Torch, 5));
         slots[4] = Some(InvSlot::new(ItemId::Gel, 5));
         assert_eq!(quick_move_dest(&slots, ItemId::Torch, 0..10), Some(3));
-        assert_eq!(quick_move_dest(&slots, ItemId::Gel, 0..4), Some(0), "empty fallback");
+        assert_eq!(
+            quick_move_dest(&slots, ItemId::Gel, 0..4),
+            Some(0),
+            "empty fallback"
+        );
         slots[3] = Some(InvSlot::new(ItemId::Torch, 999)); // full stack
         assert_eq!(quick_move_dest(&slots, ItemId::Torch, 3..5), None);
-        let full: Vec<_> = (0..5).map(|_| Some(InvSlot::new(ItemId::Dirt, 999))).collect();
+        let full: Vec<_> = (0..5)
+            .map(|_| Some(InvSlot::new(ItemId::Dirt, 999)))
+            .collect();
         assert_eq!(quick_move_dest(&full, ItemId::Gel, 0..5), None);
     }
 }

@@ -708,8 +708,9 @@ pub fn tile_color(id: TileId) -> Color {
     tint(TILE_COLORS[id as usize], 1.0)
 }
 
-/// Stable distinctive color for an item swatch — held items, hotbar slots,
-/// and dropped-item entities all share it (a real sprite atlas later).
+/// Stable distinctive color for an item swatch/glyph (a real sprite atlas
+/// later). Held items, hotbar slots, dropped-item entities, and the
+/// inventory UI all share it so an item looks the same everywhere.
 pub fn item_color(item: ItemId) -> Color {
     let n = item as u32;
     let mut h = n.wrapping_mul(0x9E37_79B9);

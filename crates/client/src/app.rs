@@ -6,20 +6,23 @@ use std::collections::HashMap;
 
 use macroquad::prelude::*;
 
+use ferraria_shared::crafting::stations_in_range;
 use ferraria_shared::items::{inventory, ArmorSlot, InvSlot, ItemId};
-use ferraria_shared::physics::{PlayerInput, PLAYER_HEIGHT, PLAYER_WIDTH};
+use ferraria_shared::loadout;
+use ferraria_shared::physics::{PhysicsMods, PlayerInput, PLAYER_HEIGHT, PLAYER_WIDTH};
 use ferraria_shared::protocol::{AuthToken, ClientMessage, ServerMessage};
 use ferraria_shared::tiles::{MINING_HELMET_LIGHT, PLAYER_GLOW};
-use ferraria_shared::world::{WorldFlags, DAY_TICKS};
+use ferraria_shared::world::{chest_in_reach, WorldFlags, DAY_TICKS};
 use ferraria_shared::{MAX_NAME_CHARS, PROTOCOL_VERSION, TICK_RATE, TILE_SIZE};
 
 use crate::entities::Entities;
-use crate::hotbar;
 use crate::interact::Interact;
 use crate::light::{self, DynamicSource, LightEngine};
 use crate::net::{WsClient, WsStatus};
 use crate::player::{OwnPlayer, RemotePlayer, Snapshot, CORRECTION_SNAP_TILES, INTERP_DELAY};
 use crate::render::{self, Camera, PlayerDraw, QuadBatch};
+use crate::ui::crafting::CraftingUi;
+use crate::ui::inventory::{ChestMirror, InventoryUi};
 use crate::ui::{self, Chat, DisconnectedChoice, Hud};
 use crate::world_view::WorldView;
 
@@ -249,9 +252,13 @@ struct Session {
     camera: Camera,
     chat: Chat,
     hud: Hud,
-    /// Server-authoritative inventory mirror (flat §8 layout). Also feeds
-    /// lighting: a Mining Helmet in the head armor slot is a light source.
+    /// Server-authoritative inventory mirror (flat §8 layout), updated by
+    /// `InventorySync` / `SlotChanged`. Also feeds lighting (a Mining Helmet
+    /// in the head armor slot is a light source).
     inventory: Vec<Option<InvSlot>>,
+    /// Equipment physics modifiers derived from `inventory` (recomputed on
+    /// every inventory delta) — feeds own-player prediction.
+    mods: PhysicsMods,
     /// Selected hotbar slot (0–9); the server learns via `SelectSlot`.
     selected: u8,
     interact: Interact,
@@ -268,6 +275,10 @@ struct Session {
     /// F3 stats: duration of the last light recompute and how many ran.
     light_ms: f64,
     light_recomputes: u64,
+    inv_ui: InventoryUi,
+    craft_ui: CraftingUi,
+    /// Mirror of the open chest (panel shows while `Some`).
+    chest: Option<ChestMirror>,
     /// World progress flags, mirrored for later UI (bosses defeated...).
     #[allow(dead_code)]
     flags: WorldFlags,
@@ -297,6 +308,7 @@ impl Session {
             chat: Chat::new(),
             hud: Hud::new(),
             inventory: vec![None; inventory::TOTAL],
+            mods: PhysicsMods::NONE,
             selected: 0,
             interact: Interact::new(),
             entities: Entities::new(),
@@ -306,6 +318,9 @@ impl Session {
             corners: Vec::new(),
             light_ms: 0.0,
             light_recomputes: 0,
+            inv_ui: InventoryUi::new(),
+            craft_ui: CraftingUi::new(),
+            chest: None,
             flags: welcome.flags,
         }
     }
@@ -327,6 +342,7 @@ impl Session {
         if is_key_pressed(KeyCode::F3) {
             self.hud.debug = !self.hud.debug;
         }
+        let chat_was_open = self.chat.open;
         if let Some(text) = self.chat.handle_input() {
             self.ws.send(&ClientMessage::Chat { text });
         }
@@ -335,13 +351,30 @@ impl Session {
         } else {
             gather_input()
         };
+        if !chat_was_open {
+            self.inventory_keys();
+        }
 
         // 3. Own-player prediction at a fixed 60 Hz, frozen until the chunk
-        // under us has streamed in.
+        // under us has streamed in. Equipment modifiers (Swift Boots, Gust
+        // Jar...) come from the synced inventory via the shared loadout fn,
+        // so the server agrees with what we predict.
         let center = self.own.phys.center();
         let frozen = !self.view.chunk_loaded_at(center.0, center.1);
-        for msg in self.own.update(self.view.world(), input, dt, frozen) {
+        for msg in self
+            .own
+            .update(self.view.world(), input, dt, frozen, self.mods)
+        {
             self.ws.send(&msg);
+        }
+
+        // Chest follows reach (§11): walking away closes it on both sides.
+        let center = self.own.phys.center();
+        if let Some(c) = &self.chest {
+            if !chest_in_reach(center, c.origin) {
+                self.chest = None;
+                self.ws.send(&ClientMessage::CloseChest);
+            }
         }
 
         // 4. Clock & camera.
@@ -353,17 +386,12 @@ impl Session {
             dt,
         );
 
-        // 4.5. Mouse world interaction (mining/placing/doors) and hotbar
-        // selection, with the fresh camera. Chat owns the keyboard while
-        // open, so hotbar keys stay quiet then.
+        // 4.5. Mouse world interaction (mining/placing/doors/chests) with
+        // the fresh camera. Quiet while chat owns the keyboard or the
+        // inventory screen owns the mouse (slot clicks must not swing).
         let tl = self.camera.top_left();
         let aim = Interact::aim(self.view.world(), tl);
-        if !self.chat.open {
-            if hotbar::selection_input(&mut self.selected) {
-                self.ws.send(&ClientMessage::SelectSlot {
-                    slot: self.selected,
-                });
-            }
+        if !self.chat.open && !self.inv_ui.open {
             self.interact.frame(
                 &self.ws,
                 self.view.world(),
@@ -457,10 +485,22 @@ impl Session {
             render::draw_vignette(1.0 - light::daylight(ticks), &mut self.batch);
         }
 
-        // 7. Overlay UI.
+        // 7. Overlay UI: HUD, then the inventory screen (hotbar always; full
+        // panels + crafting + chest while open), then chat on top. World
+        // right-clicks (doors, chests) are `Interact`'s job in step 4.5.
         self.hud
             .draw(self.remotes.len() + 1, self.clock.day, self.clock.ticks());
-        hotbar::draw(&self.inventory, self.selected);
+        let mut ui_msgs: Vec<ClientMessage> = Vec::new();
+        self.inv_ui
+            .frame(&self.inventory, self.chest.as_ref(), self.selected, &mut ui_msgs);
+        if self.inv_ui.open {
+            let stations = stations_in_range(self.view.world(), self.own.phys.center());
+            self.craft_ui
+                .frame(&self.inventory, stations, now, &mut ui_msgs);
+        }
+        for msg in ui_msgs {
+            self.ws.send(&msg);
+        }
         self.chat.draw(now);
         if self.hud.debug {
             self.hud.draw_debug(
@@ -515,6 +555,54 @@ impl Session {
         }
     }
 
+    /// Inventory-screen keys (chat closed): E toggles, Esc closes, digits
+    /// and the wheel drive the hotbar selection.
+    fn inventory_keys(&mut self) {
+        if is_key_pressed(KeyCode::E) || (is_key_pressed(KeyCode::Escape) && self.inv_ui.open) {
+            if self.inv_ui.open {
+                self.inv_ui.close();
+                if self.chest.take().is_some() {
+                    self.ws.send(&ClientMessage::CloseChest);
+                }
+            } else {
+                self.inv_ui.open = true;
+            }
+        }
+
+        const DIGITS: [KeyCode; 10] = [
+            KeyCode::Key1,
+            KeyCode::Key2,
+            KeyCode::Key3,
+            KeyCode::Key4,
+            KeyCode::Key5,
+            KeyCode::Key6,
+            KeyCode::Key7,
+            KeyCode::Key8,
+            KeyCode::Key9,
+            KeyCode::Key0,
+        ];
+        let mut selected = self.selected;
+        for (i, key) in DIGITS.iter().enumerate() {
+            if is_key_pressed(*key) {
+                selected = i as u8;
+            }
+        }
+        // Wheel cycles the hotbar while the crafting list isn't using it.
+        if !self.inv_ui.open {
+            let (_, wheel) = mouse_wheel();
+            let n = inventory::HOTBAR as i16;
+            if wheel < 0.0 {
+                selected = ((selected as i16 + 1) % n) as u8;
+            } else if wheel > 0.0 {
+                selected = ((selected as i16 + n - 1) % n) as u8;
+            }
+        }
+        if selected != self.selected {
+            self.selected = selected;
+            self.ws.send(&ClientMessage::SelectSlot { slot: selected });
+        }
+    }
+
     /// Applies one server message to the session state.
     fn apply(&mut self, msg: ServerMessage, now: f64) {
         match msg {
@@ -539,16 +627,21 @@ impl Session {
             ServerMessage::BlockCrack { x, y, damage_frac } => {
                 self.interact.on_block_crack(x, y, damage_frac, now);
             }
-            // The armor slots inside the mirror feed lighting too: a worn
-            // Mining Helmet is a light source (§10).
+            // Inventory deltas refresh the derived state too: physics mods
+            // (Swift Boots...) for prediction, the crafting panel's
+            // optimistic flash, and — via the armor mirror — lighting (a
+            // worn Mining Helmet is a light source, §10).
             ServerMessage::InventorySync { slots } => {
                 self.inventory = slots;
                 self.inventory.resize(inventory::TOTAL, None);
+                self.mods = loadout::physics_mods(&self.inventory);
             }
             ServerMessage::SlotChanged { idx, stack } => {
                 if let Some(slot) = self.inventory.get_mut(idx as usize) {
                     *slot = stack;
                 }
+                self.mods = loadout::physics_mods(&self.inventory);
+                self.craft_ui.reconcile();
             }
             ServerMessage::ItemDropSpawn {
                 id,
@@ -614,6 +707,21 @@ impl Session {
             ServerMessage::Chat { from, text } => self.chat.push_message(&from, &text, now),
             ServerMessage::Toast { text } => self.chat.push_system(text, now),
             ServerMessage::TimeSync { time, day } => self.clock.set(time, day),
+            ServerMessage::ChestContents { x, y, slots } => {
+                self.chest = Some(ChestMirror::new((x, y), slots));
+                self.inv_ui.open = true; // chest panel sits beside the inventory
+            }
+            ServerMessage::ChestSlotChanged { idx, stack } => {
+                if let Some(c) = &mut self.chest {
+                    if let Some(slot) = c.slots.get_mut(idx as usize) {
+                        *slot = stack;
+                    }
+                }
+            }
+            ServerMessage::ChestDenied => {
+                self.chat
+                    .push_system("Someone else is using that chest".into(), now);
+            }
             ServerMessage::Reject { .. }
             | ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. } => {}
