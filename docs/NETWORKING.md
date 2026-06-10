@@ -25,6 +25,9 @@ extern "C" {
     fn quad_ws_send(ptr: *const u8, len: usize);
     fn quad_ws_next_len() -> i32;          // next msg len, -1 if none
     fn quad_ws_recv(ptr: *mut u8, cap: usize) -> i32;
+    fn quad_ws_default_url(ptr: *mut u8, cap: usize) -> i32; // page-derived
+        // ws URL ("ws(s)://<host>/ws") copied into (ptr, cap); returns bytes
+        // written, -1 if it doesn't fit. Synchronous copy, no retained views.
 }
 #[no_mangle] pub extern "C" fn quad_ws_crate_version() -> u32 { 1 }
 ```

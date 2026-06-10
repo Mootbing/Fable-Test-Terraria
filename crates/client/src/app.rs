@@ -70,6 +70,9 @@ impl App {
                 hello_sent,
                 started,
             } => {
+                // No text field is live here: drop this frame's typed chars
+                // so they can't leak into the name field back in Menu.
+                ui::discard_typed_chars();
                 ui::draw_connecting(get_time() - *started);
                 connecting_frame(ws, hello_sent, *started, &self.name, self.token)
             }
@@ -78,11 +81,16 @@ impl App {
                 self.token = Some(session.token);
                 result.map(|reason| State::Disconnected { reason })
             }
-            State::Disconnected { reason } => match ui::draw_disconnected(reason) {
-                DisconnectedChoice::Reconnect => Some(connect_state()),
-                DisconnectedChoice::Menu => Some(State::Menu { error: None }),
-                DisconnectedChoice::None => None,
-            },
+            State::Disconnected { reason } => {
+                // Same: e.g. a chat message in flight when the socket died
+                // must not be typed into the name field later.
+                ui::discard_typed_chars();
+                match ui::draw_disconnected(reason) {
+                    DisconnectedChoice::Reconnect => Some(connect_state()),
+                    DisconnectedChoice::Menu => Some(State::Menu { error: None }),
+                    DisconnectedChoice::None => None,
+                }
+            }
         };
         if let Some(next) = next {
             self.state = next;
@@ -389,6 +397,13 @@ impl Session {
                     let (dx, dy) = (pos.0 - self.own.phys.pos.0, pos.1 - self.own.phys.pos.1);
                     if dx * dx + dy * dy > CORRECTION_SNAP_TILES * CORRECTION_SNAP_TILES {
                         self.own.apply_correction(pos, vel);
+                        // Recenter the camera with the player: a reclaim can
+                        // move us across the map, and smoothing there would
+                        // pan over unloaded world.
+                        let center = self.own.phys.center();
+                        let bounds = world_px(&self.view);
+                        self.camera
+                            .snap(vec2(center.0, center.1) * TILE_SIZE, bounds);
                     }
                 } else if let Some(remote) = self.remotes.get_mut(&id) {
                     remote.push(Snapshot {

@@ -258,7 +258,10 @@ async fn token_reclaim_restores_position_after_reconnect() {
     // Wait for the server to process the disconnect (frees the name).
     let mut freed = false;
     for _ in 0..50 {
-        if http_get(port, "/api/status").await.contains("\"players\":0") {
+        if http_get(port, "/api/status")
+            .await
+            .contains("\"players\":0")
+        {
             freed = true;
             break;
         }

@@ -103,11 +103,16 @@ impl OwnPlayer {
     }
 
     /// Applies an authoritative own-id correction (teleport rejection /
-    /// reconnect reclaim): adopt the server's position outright.
+    /// reconnect reclaim): adopt the server's position outright and clear
+    /// transient motion state — a held-jump rise or a live platform
+    /// drop-through must not keep acting from the corrected position.
     pub fn apply_correction(&mut self, pos: (f32, f32), vel: (f32, f32)) {
         self.phys.pos = pos;
         self.phys.vel = vel;
         self.phys.fall_distance = 0.0;
+        self.phys.jump_hold_left = 0.0;
+        self.phys.drop_through = 0.0;
+        self.phys.on_ground = false; // re-resolved by the next step
         self.last_sent = None; // force the next snapshot out
     }
 
@@ -116,7 +121,10 @@ impl OwnPlayer {
         if self.phys.on_ground {
             flags |= anim::GROUNDED;
         }
-        if self.last_step.in_water || self.last_step.in_lava {
+        // Submerged, not merely touching a liquid cell (protocol.rs
+        // documents the bit as "Submerged / swim animation"): wading
+        // ankle-deep must not broadcast the swim animation.
+        if self.last_step.swimming {
             flags |= anim::IN_LIQUID;
         }
         flags

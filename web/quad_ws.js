@@ -11,21 +11,32 @@
             // Views into wasm memory are only valid during this synchronous call.
             const url = new TextDecoder().decode(
                 new Uint8Array(wasm_memory.buffer, url_ptr, url_len));
-            if (socket !== null) { try { socket.close(); } catch (_) {} }
+            if (socket !== null) {
+                // Detach the old handlers before closing: a previous
+                // socket's async onclose firing later must not clobber
+                // `status`/`socket` for the connection created below
+                // (reconnect-while-still-connecting bug).
+                socket.onopen = socket.onclose = socket.onerror = socket.onmessage = null;
+                try { socket.close(); } catch (_) {}
+            }
             status = 0;
             queue.length = 0;
+            let s;
             try {
-                socket = new WebSocket(url);
+                s = new WebSocket(url);
             } catch (e) {           // e.g. SecurityError: ws:// from an https:// page
                 console.error("quad_ws: connect failed", e);
                 status = 2; socket = null; return;
             }
-            socket.binaryType = "arraybuffer";   // ESSENTIAL: default is "blob"
-            socket.onopen    = () => { status = 1; };
-            socket.onclose   = () => { status = 2; socket = null; };
-            socket.onerror   = (e) => { console.error("quad_ws:", e); };
-            socket.onmessage = (ev) => {
-                if (ev.data instanceof ArrayBuffer) {
+            socket = s;
+            s.binaryType = "arraybuffer";   // ESSENTIAL: default is "blob"
+            // Belt and braces with the detach above: every handler ignores
+            // events unless `s` is still the current socket.
+            s.onopen    = () => { if (socket === s) status = 1; };
+            s.onclose   = () => { if (socket === s) { status = 2; socket = null; } };
+            s.onerror   = (e) => { if (socket === s) console.error("quad_ws:", e); };
+            s.onmessage = (ev) => {
+                if (socket === s && ev.data instanceof ArrayBuffer) {
                     queue.push(new Uint8Array(ev.data));
                 }
             };

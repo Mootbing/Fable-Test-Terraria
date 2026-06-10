@@ -167,6 +167,11 @@ pub struct StepResult {
     pub in_water: bool,
     /// AABB touches a lava cell (server applies contact damage).
     pub in_lava: bool,
+    /// Body center submerged in any liquid — the same test that switches
+    /// the step to swim physics (§3), and what the swim animation
+    /// ([`crate::protocol::anim::IN_LIQUID`]) keys off. Ankle-deep wading
+    /// sets `in_water` but not this.
+    pub swimming: bool,
     pub in_cobweb: bool,
     pub hit_ceiling: bool,
 }
@@ -349,6 +354,7 @@ pub fn step_player(
 
     // Environment.
     let swimming = liquid_at_center(world, p.pos, size).is_some();
+    out.swimming = swimming;
     out.in_water = aabb_touches_liquid(world, p.pos, size, LiquidKind::Water);
     out.in_lava = aabb_touches_liquid(world, p.pos, size, LiquidKind::Lava);
     out.in_cobweb = aabb_overlaps_tile(world, p.pos, size, TileId::Cobweb);
@@ -780,7 +786,27 @@ mod tests {
         // Swim impulse: a jump press while submerged kicks upward at 12 t/s.
         let r = step_player(&world, &mut p, JUMP, DT);
         assert!(r.in_water);
+        assert!(r.swimming, "body center is submerged");
         assert!(p.vel.1 < -SWIM_IMPULSE * 0.8, "swim impulse applied");
+    }
+
+    #[test]
+    fn ankle_deep_water_wades_without_swimming() {
+        // One row of water resting on the floor: the AABB touches it, but
+        // the body center (height 2.75 → center 1.375 above the feet) stays
+        // dry, so this is wading, not swimming.
+        let world = world_from_ascii(&[
+            "..........",
+            "..........",
+            "..........",
+            "wwwwwwwwww",
+            "##########",
+        ]);
+        let mut p = PlayerPhysics::from_feet(5.0, 4.0);
+        settle(&world, &mut p);
+        let r = step_player(&world, &mut p, PlayerInput::default(), DT);
+        assert!(r.in_water, "feet are in the water");
+        assert!(!r.swimming, "ankle-deep is not submerged");
     }
 
     #[test]

@@ -324,8 +324,16 @@ impl Sim {
         // Queue the newcomer's join state in order: Welcome first, then the
         // player's own authoritative position, inventory, time, the
         // existing-player roster, then chunks.
-        let mut frames: Vec<Frame> = Vec::new();
-        frames.push(
+        //
+        // The own-id `PlayerMoved` matters on token reclaim: `Welcome`
+        // carries only the world spawn, but a reclaim restores the player's
+        // previous position (and the chunk window streams around it).
+        // Without this frame the client would predict from the spawn it
+        // placed itself at — frozen forever on a far reclaim because the
+        // spawn chunk never streams. The client snaps to any own-id
+        // `PlayerMoved` that disagrees by > 1 tile, so this is a no-op on a
+        // fresh spawn (identical placement formula on both sides).
+        let mut frames: Vec<Frame> = vec![
             encode(&ServerMessage::Welcome {
                 player_id: id,
                 token,
@@ -337,15 +345,6 @@ impl Sim {
                 flags: self.world.flags,
             })
             .into(),
-        );
-        // Own-id placement: `Welcome` carries only the world spawn, but a
-        // token reclaim restores the player's previous position (and the
-        // chunk window streams around it). Without this frame the client
-        // would predict from the spawn it placed itself at — frozen forever
-        // on a far reclaim because the spawn chunk never streams. The client
-        // snaps to any own-id `PlayerMoved` that disagrees by > 1 tile, so
-        // this is a no-op on a fresh spawn (identical placement formula).
-        frames.push(
             encode(&ServerMessage::PlayerMoved {
                 id,
                 pos,
@@ -354,20 +353,16 @@ impl Sim {
                 anim: 0,
             })
             .into(),
-        );
-        frames.push(
             encode(&ServerMessage::InventorySync {
                 slots: player.inventory.clone(),
             })
             .into(),
-        );
-        frames.push(
             encode(&ServerMessage::TimeSync {
                 time: self.world.time,
                 day: self.world.day,
             })
             .into(),
-        );
+        ];
         for (&oid, other) in &self.players {
             frames.push(
                 encode(&ServerMessage::PlayerJoined {
@@ -446,7 +441,7 @@ impl Sim {
     /// THE dispatch point for client messages. Later feature PRs (mining,
     /// placing, combat, inventory, NPCs) add one arm per intent here.
     fn handle_message(&mut self, id: u32, epoch: u64, msg: ClientMessage) {
-        if !self.players.get(&id).is_some_and(|p| p.epoch == epoch) {
+        if self.players.get(&id).is_none_or(|p| p.epoch != epoch) {
             return; // message raced a disconnect, or is from a stale session
         }
         match msg {
@@ -1175,8 +1170,7 @@ mod tests {
             },
         );
         assert_eq!(
-            sim.players[&id].pos,
-            start,
+            sim.players[&id].pos, start,
             "jump beyond the budget cap rejected even after long silence"
         );
     }
