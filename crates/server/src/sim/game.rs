@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
+use ferraria_shared::coins::coin_total;
 use ferraria_shared::inventory_ops::SlotOp;
 use ferraria_shared::items::{inventory, InvSlot, ItemId, STARTING_KIT};
 use ferraria_shared::physics::{PlayerPhysics, PLAYER_HEIGHT, PLAYER_WIDTH};
@@ -33,13 +34,14 @@ use ferraria_shared::world::{
 };
 use ferraria_shared::{
     CHAT_MAX_CHARS, HELD_ITEM_BROADCAST_MIN_TICKS, MAX_NAME_CHARS, MAX_PLAYERS, MAX_PLAYER_SPEED,
-    MAX_TELEPORT_BUDGET_TILES, MAX_TELEPORT_PER_TICK, SNAPSHOT_INTERVAL_TICKS, TICK_RATE,
-    TIME_SYNC_INTERVAL_TICKS,
+    MAX_TELEPORT_BUDGET_TILES, MAX_TELEPORT_PER_TICK, PLAYER_BASE_MAX_HP, SNAPSHOT_INTERVAL_TICKS,
+    TICK_RATE, TIME_SYNC_INTERVAL_TICKS,
 };
 
 use super::entities::EntityStore;
 use super::fluids::FluidSim;
 use super::interact::TileDamage;
+use super::npc::TownState;
 
 /// One encoded `ServerMessage`, shared between sessions without re-encoding.
 pub type Frame = Arc<[u8]>;
@@ -248,6 +250,8 @@ pub struct Sim {
     /// Queued by [`Sim::queue_support_checks`], drained by
     /// `Sim::revalidate_supports` after every command and every tick.
     pub(crate) support_checks: Vec<(u32, u32)>,
+    /// Town NPC roster + arrival bookkeeping (§7, `sim::npc`).
+    pub(crate) town: TownState,
 }
 
 impl Sim {
@@ -276,8 +280,12 @@ impl Sim {
             enemy_iframes: HashMap::new(),
             tile_batch: Vec::new(),
             support_checks: Vec::new(),
+            town: TownState::default(),
         };
         sim.scan_initial_puddles();
+        // §7.2: the Sage is here from the start. NPC state isn't persisted
+        // yet, so every boot counts as "first world boot".
+        sim.init_npcs();
         sim
     }
 
@@ -347,9 +355,10 @@ impl Sim {
             }
         }
 
-        // Live world systems (fluids §3, sand/grass/saplings §2) and
-        // entities. Their batched cell changes flush as one `TilesChanged`
-        // per player at the end of the tick.
+        // Live world systems (fluids §3, sand/grass/saplings §2), entities,
+        // and town NPCs (§7: dawn events, hourly arrival checks, AI). Their
+        // batched cell changes flush as one `TilesChanged` per player at
+        // the end of the tick.
         self.world_tick();
         self.tick_entities();
         // Enemies & combat (§5) and player survival (§8).
@@ -360,6 +369,8 @@ impl Sim {
         self.tick_enemy_contact();
         self.tick_player_vitals();
         self.purge_enemy_iframes();
+        // Town NPCs (§7).
+        self.tick_npcs();
         self.revalidate_supports();
 
         // Chest locks follow their openers: walking out of reach closes the
@@ -371,8 +382,6 @@ impl Sim {
         if self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS as u64) {
             self.broadcast_entity_updates();
         }
-
-        // (NPC branch: town NPCs tick here.)
 
         self.flush_kicks();
     }
@@ -412,34 +421,33 @@ impl Sim {
             }
             None => None,
         };
-        let (id, token, pos, held_slot, inv, hp, max_hp, bed_spawn) = match reclaimed {
-            Some(rec) => (
-                rec.id,
-                rec.token,
-                rec.pos,
-                rec.held_slot,
-                rec.inventory,
-                rec.hp,
-                rec.max_hp,
-                rec.bed_spawn,
-            ),
+        let rec = match reclaimed {
+            Some(rec) => rec,
             None => {
                 let id = self.next_player_id;
                 self.next_player_id += 1;
-                let pos = spawn_pos(&self.world);
-                let base = ferraria_shared::PLAYER_BASE_MAX_HP as u16;
-                (
+                OfflinePlayer {
                     id,
-                    self.fresh_token(),
-                    pos,
-                    0,
-                    starting_inventory(),
-                    base,
-                    base,
-                    None,
-                )
+                    token: self.fresh_token(),
+                    pos: spawn_pos(&self.world),
+                    held_slot: 0,
+                    inventory: starting_inventory(),
+                    hp: PLAYER_BASE_MAX_HP as u16,
+                    max_hp: PLAYER_BASE_MAX_HP as u16,
+                    bed_spawn: None,
+                }
             }
         };
+        let OfflinePlayer {
+            id,
+            token,
+            pos,
+            held_slot,
+            inventory: inv,
+            hp,
+            max_hp,
+            bed_spawn,
+        } = rec;
         let epoch = self.next_epoch;
         self.next_epoch += 1;
         let player = Player {
@@ -472,6 +480,8 @@ impl Sim {
             burn_acc: 0.0,
             drown_acc: 0.0,
             breath: ferraria_shared::PLAYER_MAX_BREATH as u16,
+            // Debuffs don't survive a disconnect (they'd have ticked away
+            // offline anyway).
             debuffs: Vec::new(),
             fall_accum: 0.0,
             was_grounded: true,
@@ -572,6 +582,12 @@ impl Sim {
         self.player_count
             .store(self.players.len(), Ordering::Relaxed);
         self.update_player_chunks(id);
+        // Town roster + own health, after the chunk stream (clients don't
+        // care about ordering; it keeps the join-state frame sequence that
+        // pre-NPC tests pin intact).
+        let roster = self.npc_list_message();
+        self.send_to(id, &roster);
+        self.send_to(id, &ServerMessage::PlayerHealth { id, hp, max_hp });
         let _ = reply.send(Ok((id, epoch)));
         tracing::info!(player = id, name = %name, "player joined");
     }
@@ -620,6 +636,31 @@ impl Sim {
         self.player_count
             .store(self.players.len(), Ordering::Relaxed);
         self.broadcast(&ServerMessage::PlayerLeft { id });
+    }
+
+    /// §7.2 "All players' combined inventory coins": online sessions plus
+    /// the parked offline records. Nothing is counted twice — a reclaim
+    /// removes the offline record before the session goes online, and
+    /// `join` rejects a name that is already online.
+    pub(crate) fn combined_player_coins(&self) -> u64 {
+        let online: u64 = self
+            .players
+            .values()
+            .map(|p| coin_total(&p.inventory))
+            .sum();
+        let offline: u64 = self
+            .offline
+            .values()
+            .map(|rec| coin_total(&rec.inventory))
+            .sum();
+        online + offline
+    }
+
+    /// §7.2 "Any player has max HP > `hp`", online or parked offline (same
+    /// no-double-count argument as [`Sim::combined_player_coins`]).
+    pub(crate) fn any_player_max_hp_over(&self, hp: u32) -> bool {
+        self.players.values().any(|p| u32::from(p.max_hp) > hp)
+            || self.offline.values().any(|rec| u32::from(rec.max_hp) > hp)
     }
 
     fn flush_kicks(&mut self) {
@@ -696,6 +737,18 @@ impl Sim {
             } => self.chest_move_slot(id, chest_slot, inv_slot, to_chest),
             ClientMessage::UseItem { slot, aim } => self.use_item(id, slot, aim),
             ClientMessage::Respawn => self.respawn_player(id),
+            ClientMessage::TalkNpc { npc_id } => self.talk_npc(id, npc_id),
+            ClientMessage::BuyItem {
+                npc_id,
+                item,
+                count,
+            } => self.buy_item(id, npc_id, item, count),
+            ClientMessage::SellItem {
+                npc_id,
+                slot,
+                count,
+            } => self.sell_item(id, npc_id, slot, count),
+            ClientMessage::NurseHeal => self.nurse_heal(id),
             ClientMessage::SetBedSpawn { x, y } => self.set_bed_spawn(id, x, y),
             other => {
                 tracing::debug!(player = id, msg = ?other, "intent not implemented yet");

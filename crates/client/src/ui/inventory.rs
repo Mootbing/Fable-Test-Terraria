@@ -11,6 +11,7 @@
 
 use macroquad::prelude::*;
 
+use ferraria_shared::coins::is_coin;
 use ferraria_shared::inventory_ops::{inventory_role, quick_move_dest, SlotRole};
 use ferraria_shared::items::{
     inventory as layout, set_bonus, AccessoryEffect, ArmorSlot, Consumable, InvSlot, ItemId,
@@ -68,6 +69,14 @@ pub struct ChestMirror {
     pub slots: Vec<Option<InvSlot>>,
 }
 
+/// The open merchant shop window as a sell drop-target (§7.3): dropping a
+/// carried stack on `rect` or shift-clicking an inventory slot sends
+/// `SellItem` to `npc_id`, and tooltips grow a sell-price line.
+pub struct SellTarget {
+    pub npc_id: u32,
+    pub rect: Rect,
+}
+
 impl ChestMirror {
     pub fn new(origin: (u32, u32), slots: Vec<Option<InvSlot>>) -> ChestMirror {
         let mut slots = slots;
@@ -101,14 +110,18 @@ impl InventoryUi {
 
     /// Draws the hotbar (always) and, when open, the full inventory screen
     /// (+ chest panel if a chest is open). Mouse actions append protocol
-    /// messages to `out`.
+    /// messages to `out`. `sell` is the open shop window, if any (sell mode).
+    /// Returns `true` when this frame's LMB press dropped the carried stack:
+    /// the press is spent, and click-sensitive UI drawn later in the frame
+    /// (the shop window) must ignore it.
     pub fn frame(
         &mut self,
         inv: &[Option<InvSlot>],
         chest: Option<&ChestMirror>,
+        sell: Option<&SellTarget>,
         selected: u8,
         out: &mut Vec<ClientMessage>,
-    ) {
+    ) -> bool {
         let mouse = mouse_position();
         let mut hovered: Option<UiAddr> = None;
 
@@ -128,11 +141,11 @@ impl InventoryUi {
             // Tooltip for hotbar hover even with the screen closed.
             if let Some(addr) = hovered {
                 if let Some(stack) = slot_at(inv, chest, addr) {
-                    draw_tooltip(mouse, stack);
+                    draw_tooltip(mouse, stack, sell.is_some());
                 }
             }
             self.carried = None;
-            return;
+            return false;
         }
 
         // ---- Backpack grid. ------------------------------------------------
@@ -175,7 +188,7 @@ impl InventoryUi {
         shadow_text(&self.coin_text, ORIGIN.0, grid_bottom + 14.0, 20.0, TEXT);
 
         // ---- Mouse actions. --------------------------------------------------------
-        self.handle_clicks(inv, chest, hovered, out);
+        let click_spent = self.handle_clicks(inv, chest, sell, hovered, out);
 
         // ---- Carried stack + tooltip, over everything. -------------------------------
         if let Some(c) = self.carried {
@@ -196,33 +209,61 @@ impl InventoryUi {
             }
         } else if let Some(addr) = hovered {
             if let Some(stack) = slot_at(inv, chest, addr) {
-                draw_tooltip(mouse, stack);
+                draw_tooltip(mouse, stack, sell.is_some());
             }
         }
+        click_spent
     }
 
-    /// LMB/RMB/shift-click/Q handling against the hovered slot.
+    /// LMB/RMB/shift-click/Q handling against the hovered slot (and the
+    /// shop sell target while one is open). Returns `true` when an LMB
+    /// press dropped the carried stack (see [`InventoryUi::frame`]).
     fn handle_clicks(
         &mut self,
         inv: &[Option<InvSlot>],
         chest: Option<&ChestMirror>,
+        sell: Option<&SellTarget>,
         hovered: Option<UiAddr>,
         out: &mut Vec<ClientMessage>,
-    ) {
+    ) -> bool {
         let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
         let lmb = is_mouse_button_pressed(MouseButton::Left);
         let rmb = is_mouse_button_pressed(MouseButton::Right);
         if !lmb && !rmb && !is_key_pressed(KeyCode::Q) {
-            return;
+            return false;
         }
+        // An LMB press while carrying lands the stack somewhere below; the
+        // press is spent either way.
+        let click_spent = lmb && self.carried.is_some();
 
         let Some(addr) = hovered else {
-            // Click outside any slot: the carried stack goes back (nothing
-            // ever left the source slot server-side).
             if lmb || rmb {
+                // Carried stack dropped on the shop window: sell it (the
+                // server validates value/count; nothing moved client-side).
+                // Coins never sell (§7.3 — the merchant doesn't buy
+                // currency): a dropped coin stack just snaps back.
+                if let (Some(c), Some(target)) = (self.carried, sell) {
+                    if target.rect.contains(mouse_position()) {
+                        if let (UiAddr::Inv(i), Some(s)) = (c.from, slot_at(inv, chest, c.from)) {
+                            if !is_coin(s.item) {
+                                let count = match c.amount {
+                                    Carry::All => s.count,
+                                    Carry::Half => s.count.div_ceil(2),
+                                };
+                                out.push(ClientMessage::SellItem {
+                                    npc_id: target.npc_id,
+                                    slot: i as u8,
+                                    count,
+                                });
+                            }
+                        }
+                    }
+                }
+                // Otherwise the carried stack just goes back (nothing ever
+                // left the source slot server-side).
                 self.carried = None;
             }
-            return;
+            return click_spent;
         };
         let stack = slot_at(inv, chest, addr);
 
@@ -234,7 +275,7 @@ impl InventoryUi {
                     count: s.count,
                 });
             }
-            return;
+            return click_spent;
         }
 
         if let Some(c) = self.carried {
@@ -245,14 +286,28 @@ impl InventoryUi {
                 }
                 self.carried = None;
             }
-            return;
+            return click_spent;
         }
 
-        let Some(s) = stack else { return };
+        let Some(s) = stack else { return false };
         if shift && lmb {
-            // Quick-move to the paired region.
-            if let Some(msg) = quick_move(inv, chest, addr, s) {
-                out.push(msg);
+            // While a shop is open, shift-click sells from the inventory
+            // (whole stack); otherwise quick-move to the paired region.
+            // Coins are exempt (§7.3: the merchant won't buy currency at
+            // 20% of face value) and keep their quick-move gesture.
+            match (sell, addr) {
+                (Some(target), UiAddr::Inv(i)) if !is_coin(s.item) => {
+                    out.push(ClientMessage::SellItem {
+                        npc_id: target.npc_id,
+                        slot: i as u8,
+                        count: s.count,
+                    });
+                }
+                _ => {
+                    if let Some(msg) = quick_move(inv, chest, addr, s) {
+                        out.push(msg);
+                    }
+                }
             }
         } else if lmb {
             self.carried = Some(Carried {
@@ -268,6 +323,8 @@ impl InventoryUi {
             };
             self.carried = Some(Carried { from: addr, amount });
         }
+        // Pickups reach here (nothing was carried): the press isn't spent.
+        false
     }
 
     fn draw_slot(&self, r: Rect, addr: UiAddr, stack: Option<InvSlot>) {
@@ -593,8 +650,9 @@ fn draw_silhouette(r: Rect, role: SlotRole) {
 // ---- Tooltips & coins -----------------------------------------------------------------
 
 /// Item tooltip at the mouse: name, combat/tool/armor/accessory/consumable
-/// lines, and the coin value. Allocates only while actually hovering.
-pub fn draw_tooltip(mouse: (f32, f32), stack: InvSlot) {
+/// lines, and the coin value — plus the §7.3 sell price while a merchant
+/// shop is open (`selling`). Allocates only while actually hovering.
+pub fn draw_tooltip(mouse: (f32, f32), stack: InvSlot, selling: bool) {
     let d = stack.item.data();
     let mut lines: Vec<(String, Color)> = vec![(d.name.to_string(), TEXT)];
     if let Some(w) = d.weapon {
@@ -653,6 +711,25 @@ pub fn draw_tooltip(mouse: (f32, f32), stack: InvSlot) {
     }
     if d.value > 0 {
         lines.push((format!("Value: {}", format_coins(d.value as u64)), DIM));
+    }
+    if selling {
+        let each = ferraria_shared::npc::sell_price(stack.item);
+        if each > 0 {
+            let total = each as u64 * stack.count as u64;
+            let text = if stack.count > 1 {
+                format!(
+                    "Sell: {} each ({} for {})",
+                    format_coins(each as u64),
+                    format_coins(total),
+                    stack.count
+                )
+            } else {
+                format!("Sell: {}", format_coins(total))
+            };
+            lines.push((text, Color::new(0.95, 0.85, 0.45, 1.0)));
+        } else {
+            lines.push(("The Merchant won't buy this".to_string(), DIM));
+        }
     }
 
     let width = lines

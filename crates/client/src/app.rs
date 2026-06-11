@@ -22,9 +22,11 @@ use crate::entities::Entities;
 use crate::interact::Interact;
 use crate::light::{self, DynamicSource, LightEngine};
 use crate::net::{WsClient, WsStatus};
+use crate::npcs::Npcs;
 use crate::player::{OwnPlayer, RemotePlayer, Snapshot, CORRECTION_SNAP_TILES, INTERP_DELAY};
 use crate::render::{self, Camera, PlayerDraw, QuadBatch};
 use crate::ui::crafting::CraftingUi;
+use crate::ui::dialogue::DialogueUi;
 use crate::ui::inventory::{ChestMirror, InventoryUi};
 use crate::ui::{self, Chat, DisconnectedChoice, Hud};
 use crate::world_view::WorldView;
@@ -283,22 +285,25 @@ struct Session {
     /// Mirror of the open chest (panel shows while `Some`).
     chest: Option<ChestMirror>,
     /// Server-authoritative own vitals (§8), mirrored for the HUD:
-    /// `PlayerHealth` / `PlayerBreath` deltas.
+    /// `PlayerHealth` / `PlayerBreath` deltas. Also drives the Nurse cost
+    /// preview (§7.4).
     hp: u16,
     max_hp: u16,
     breath: u16,
     /// Own active debuffs — the `PlayerDebuffs` replacement list plus its
     /// arrival time, so the HUD timers and the §10 Darkness light dimming
-    /// count the synced ticks down locally.
+    /// count the synced ticks down locally (the Nurse preview reads it too).
     debuffs: Vec<ActiveDebuff>,
     debuffs_at: f64,
     /// Dead (§8): set by `PlayerDied`, cleared by `PlayerRespawned`. Gates
     /// movement and world interaction — the server drops both from corpses.
     dead: bool,
     died_at: f64,
-    /// World progress flags, mirrored for later UI (bosses defeated...).
-    #[allow(dead_code)]
+    /// World progress flags (bosses defeated): Nurse cost preview (§7.4).
     flags: WorldFlags,
+    /// Town NPC mirror + the dialogue/shop UI (§7).
+    npcs: Npcs,
+    dialogue: DialogueUi,
 }
 
 impl Session {
@@ -346,6 +351,8 @@ impl Session {
             dead: false,
             died_at: f64::NEG_INFINITY,
             flags: welcome.flags,
+            npcs: Npcs::new(),
+            dialogue: DialogueUi::new(),
         }
     }
 
@@ -415,6 +422,14 @@ impl Session {
             }
         }
 
+        // The dialogue panel follows talk range the same way (§7): walking
+        // away from the NPC (or the NPC despawning) closes it.
+        if let Some(npc_id) = self.dialogue.npc_id() {
+            if !self.npcs.in_reach(npc_id, center, now - INTERP_DELAY) {
+                self.dialogue.close();
+            }
+        }
+
         // 4. Clock & camera.
         self.clock.advance(dt);
         let center = self.own.phys.center();
@@ -426,11 +441,24 @@ impl Session {
 
         // 4.5. Mouse world interaction (mining/placing/combat/doors/chests)
         // with the fresh camera. Quiet while chat owns the keyboard, the
-        // inventory screen owns the mouse (slot clicks must not swing), or
-        // we're dead (§8: the dispatch gate drops world intents anyway).
+        // inventory screen / dialogue panel owns the mouse (slot clicks and
+        // Heal/Shop-button clicks must not swing or place), or we're dead
+        // (§8: the dispatch gate drops world intents anyway). A right-click
+        // on a hovered in-range NPC talks instead (§7.4 "Right-click →
+        // Heal" is this path on the Nurse) and outranks the tile behind it.
         let tl = self.camera.top_left();
         let aim = Interact::aim(self.view.world(), tl);
-        if !self.chat.open && !self.inv_ui.open && !self.dead {
+        if !self.chat.open && !self.inv_ui.open && !self.dialogue.is_open() && !self.dead {
+            let (mx, my) = mouse_position();
+            let cursor = ((mx + tl.x) / TILE_SIZE, (my + tl.y) / TILE_SIZE);
+            let hovered_npc = self
+                .npcs
+                .hovered_in_reach(cursor, center, now - INTERP_DELAY);
+            if let Some(npc_id) = hovered_npc {
+                if is_mouse_button_pressed(MouseButton::Right) {
+                    self.ws.send(&ClientMessage::TalkNpc { npc_id });
+                }
+            }
             self.interact.frame(
                 &self.ws,
                 self.view.world(),
@@ -439,6 +467,7 @@ impl Session {
                 self.selected,
                 aim,
                 Interact::mouse_world(tl),
+                hovered_npc.is_some(),
                 now,
                 dt,
             );
@@ -485,6 +514,7 @@ impl Session {
         );
         self.interact.draw_cracks(now, tl, &self.light);
         self.entities.draw(render_t, now, tl, &self.light);
+        self.npcs.draw(render_t, now, tl, &self.light, center);
         for &(id, s) in &self.remote_samples {
             let Some(remote) = self.remotes.get(&id) else {
                 continue;
@@ -560,9 +590,14 @@ impl Session {
             now,
         );
         let mut ui_msgs: Vec<ClientMessage> = Vec::new();
-        self.inv_ui.frame(
+        let sell = self.dialogue.sell_target();
+        // A drag-drop that lands a carried stack spends its LMB press: the
+        // dialogue/shop UI below must ignore it (a sell drop on the shop
+        // window would otherwise also buy the cell under the cursor).
+        let click_spent = self.inv_ui.frame(
             &self.inventory,
             self.chest.as_ref(),
+            sell.as_ref(),
             self.selected,
             &mut ui_msgs,
         );
@@ -570,6 +605,25 @@ impl Session {
             let stations = stations_in_range(self.view.world(), self.own.phys.center());
             self.craft_ui
                 .frame(&self.inventory, stations, now, &mut ui_msgs);
+        }
+        // NPC dialogue panel + merchant shop window (§7.3–§7.5).
+        let shop_opened = self.dialogue.frame(
+            &self.inventory,
+            self.hp,
+            self.max_hp,
+            &self.debuffs,
+            self.flags,
+            now,
+            click_spent,
+            &mut ui_msgs,
+        );
+        if shop_opened {
+            // The shop window sits where the chest panel would: show the
+            // inventory beside it and let go of any open chest.
+            self.inv_ui.open = true;
+            if self.chest.take().is_some() {
+                self.ws.send(&ClientMessage::CloseChest);
+            }
         }
         for msg in ui_msgs {
             self.ws.send(&msg);
@@ -643,17 +697,25 @@ impl Session {
         }
     }
 
-    /// Inventory-screen keys (chat closed): E toggles, Esc closes, digits
-    /// and the wheel drive the hotbar selection.
+    /// Inventory/dialogue keys (chat closed): E closes an open dialogue,
+    /// else toggles the inventory (talking to an NPC is a right-click on
+    /// them, step 4.5); Esc closes whatever is open; digits and the wheel
+    /// drive the hotbar.
     fn inventory_keys(&mut self) {
-        if is_key_pressed(KeyCode::E) || (is_key_pressed(KeyCode::Escape) && self.inv_ui.open) {
-            if self.inv_ui.open {
-                self.inv_ui.close();
-                if self.chest.take().is_some() {
-                    self.ws.send(&ClientMessage::CloseChest);
-                }
+        if is_key_pressed(KeyCode::E) {
+            if self.dialogue.is_open() {
+                // Single-line dialogue: "advance" closes the panel.
+                self.dialogue.close();
+            } else if self.inv_ui.open {
+                self.close_inventory();
             } else {
                 self.inv_ui.open = true;
+            }
+        } else if is_key_pressed(KeyCode::Escape) {
+            if self.dialogue.is_open() {
+                self.dialogue.close();
+            } else if self.inv_ui.open {
+                self.close_inventory();
             }
         }
 
@@ -688,6 +750,13 @@ impl Session {
         if selected != self.selected {
             self.selected = selected;
             self.ws.send(&ClientMessage::SelectSlot { slot: selected });
+        }
+    }
+
+    fn close_inventory(&mut self) {
+        self.inv_ui.close();
+        if self.chest.take().is_some() {
+            self.ws.send(&ClientMessage::CloseChest);
         }
     }
 
@@ -730,6 +799,7 @@ impl Session {
                 }
                 self.mods = loadout::physics_mods(&self.inventory);
                 self.craft_ui.reconcile();
+                self.dialogue.reconcile();
             }
             ServerMessage::ItemDropSpawn {
                 id,
@@ -741,12 +811,21 @@ impl Session {
             ServerMessage::EntitySpawn {
                 id, kind, pos, vel, ..
             } => self.entities.spawn_other(id, kind, pos, vel, now),
-            ServerMessage::EntityUpdate { entities } => self.entities.update(&entities, now),
+            ServerMessage::EntityUpdate { entities } => {
+                // NPCs and generic entities share the id space; each mirror
+                // ignores ids it doesn't track.
+                self.npcs.update(&entities, now);
+                self.entities.update(&entities, now);
+            }
             ServerMessage::EntityHurt { id, damage, crit } => {
                 self.entities.on_hurt(id, damage, crit, now)
             }
             ServerMessage::EntityDespawn { id, reason } => {
-                self.entities.on_despawn(id, reason, now)
+                self.entities.on_despawn(id, reason, now);
+                self.npcs.remove(id);
+                if self.dialogue.npc_id() == Some(id) {
+                    self.dialogue.close();
+                }
             }
             ServerMessage::ItemPickedUp { id, .. } => self.entities.remove(id),
             ServerMessage::PlayerJoined { id, name, pos } => {
@@ -868,11 +947,31 @@ impl Session {
                 self.chat
                     .push_system("Someone else is using that chest".into(), now);
             }
+            ServerMessage::NpcList { npcs } => {
+                self.npcs.apply_list(npcs, now);
+                if let Some(npc_id) = self.dialogue.npc_id() {
+                    if self.npcs.get(npc_id).is_none() {
+                        self.dialogue.close();
+                    }
+                }
+            }
+            ServerMessage::NpcDialogue { npc_id, line } => {
+                if let Some(npc) = self.npcs.get(npc_id) {
+                    self.dialogue
+                        .open_line(npc_id, npc.kind, npc.name.clone(), line);
+                }
+            }
+            ServerMessage::ShopContents { npc_id, items } => {
+                self.dialogue.set_shop(npc_id, items);
+            }
+            ServerMessage::WorldFlags { flags } => self.flags = flags,
+            // Session-layer messages, consumed before `apply` (`Reject`/
+            // `Welcome`) or by the ping loop (`Pong`). The match is
+            // exhaustive on purpose: a new protocol variant must be wired
+            // (or parked here) explicitly.
             ServerMessage::Reject { .. }
             | ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. } => {}
-            // NPCs: rendered by the npcs-dialogue branch.
-            _ => {}
         }
     }
 }

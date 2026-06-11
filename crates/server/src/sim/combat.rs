@@ -329,8 +329,9 @@ impl Sim {
             },
         );
         let eid = self.entities.insert(entity);
-        let msg = super::entities::spawn_message(eid, &entity);
-        self.broadcast_at(center.0.max(0.0) as u32, center.1.max(0.0) as u32, &msg);
+        if let Some(msg) = super::entities::spawn_message(eid, &entity) {
+            self.broadcast_at(center.0.max(0.0) as u32, center.1.max(0.0) as u32, &msg);
+        }
     }
 
     /// Spawns the §5.2 Ash Demon volley: 4 Void Sickles fanned at the
@@ -352,8 +353,9 @@ impl Sim {
                 self.tick,
             );
             let eid = self.entities.insert(entity);
-            let msg = super::entities::spawn_message(eid, &entity);
-            self.broadcast_at(from.0.max(0.0) as u32, from.1.max(0.0) as u32, &msg);
+            if let Some(msg) = super::entities::spawn_message(eid, &entity) {
+                self.broadcast_at(from.0.max(0.0) as u32, from.1.max(0.0) as u32, &msg);
+            }
         }
     }
 

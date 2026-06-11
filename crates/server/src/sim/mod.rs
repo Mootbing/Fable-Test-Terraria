@@ -2,17 +2,19 @@
 //! fluid automaton ([`fluids`]), the mine/place/build intents ([`interact`]),
 //! the dropped-item entities ([`entities`]), the inventory/crafting/chest
 //! intent handlers ([`inventory`]), and the live world ticks — fluids
-//! cadence, falling sand, grass/sapling random ticks ([`world_tick`]).
-//! Enemies, combat, and the rest of the tick pipeline arrive with later PRs
-//! and plug into [`game::Sim::tick`].
+//! cadence, falling sand, grass/sapling random ticks ([`world_tick`]) —
+//! plus enemies/combat (§5, [`enemies`]/[`combat`]), player survival (§8,
+//! [`survival`]), and town NPCs/housing (§7, [`npc`]/[`housing`]).
 
 pub mod combat;
 pub mod enemies;
 pub mod entities;
 pub mod fluids;
 pub mod game;
+pub mod housing;
 pub mod interact;
 mod inventory;
+pub mod npc;
 pub mod survival;
 pub mod world_tick;
 
@@ -28,6 +30,7 @@ pub(crate) mod test_util {
     use ferraria_shared::items::{InvSlot, ItemId};
     use ferraria_shared::physics::{PLAYER_HEIGHT, PLAYER_WIDTH};
     use ferraria_shared::protocol::{decode, ClientMessage, ServerMessage};
+    use ferraria_shared::rng::Pcg32;
     use ferraria_shared::tiles::{Tile, TileId};
     use ferraria_shared::world::World;
 
@@ -44,7 +47,11 @@ pub(crate) mod test_util {
             }
         }
         world.spawn = (width / 2, floor_y - 1);
-        Sim::new(world, Arc::new(AtomicUsize::new(0)))
+        let mut sim = Sim::new(world, Arc::new(AtomicUsize::new(0)));
+        // Entropy seeding belongs to production boots; the test suite must
+        // replay identically run-to-run (NPC wander walks, loot rolls).
+        sim.loot_rng = Pcg32::new(0xF3AA_11A5);
+        sim
     }
 
     /// Joins a player; returns their id, session epoch, and frame receiver.

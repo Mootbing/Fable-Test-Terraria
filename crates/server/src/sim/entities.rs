@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use ferraria_shared::enemies::EnemyKind;
 use ferraria_shared::items::{add_to_inventory, ItemId};
 use ferraria_shared::physics::{hitbox, step_item_drop, ITEM_SPAWN_SPEED_X, ITEM_SPAWN_SPEED_Y};
-use ferraria_shared::protocol::{DespawnReason, EntityState, ServerMessage};
+use ferraria_shared::protocol::{DespawnReason, EntityState, NpcKind, ServerMessage};
 use ferraria_shared::tiles::LiquidKind;
 use ferraria_shared::world::CHUNK_SIZE;
 use ferraria_shared::{
@@ -40,6 +40,14 @@ pub enum EntityKind {
     /// An unsupported sand tile in flight (§2 tile 4), stepped by
     /// `Sim::step_falling_sand` and converted back to a tile on landing.
     FallingSand,
+    /// A town NPC (§7). Per-NPC state (HP, home, AI) lives in
+    /// `Sim::npcs`, keyed by this entity's id; the store carries the
+    /// shared pos/vel for snapshot batching and chunk visibility. NPCs
+    /// announce themselves via `ServerMessage::NpcList` (roster broadcast
+    /// to everyone), not per-chunk spawn messages.
+    Npc {
+        kind: NpcKind,
+    },
     /// A live §5 enemy (stats in `shared::enemies::ENEMY_DATA`; AI state in
     /// [`Entity::ai`], HP in [`Entity::hp`]).
     Enemy(EnemyKind),
@@ -97,7 +105,11 @@ pub struct Entity {
     pub spawn_tick: u64,
     /// Changed since the last snapshot batch; cleared after broadcasting.
     pub awake: bool,
-    /// Hit points (enemies; 0 for drops/projectiles).
+    /// Kind-specific wire state byte carried in `EntityState` snapshots
+    /// (NPCs: facing/walking animation bits; 0 for drops/sand/enemies).
+    pub state: u8,
+    /// Hit points (enemies; 0 for drops/NPCs/projectiles — NPC HP lives in
+    /// `Sim::town`).
     pub hp: u16,
     /// HP changed since the last snapshot batch (sent as `EntityState::hp`).
     pub hp_dirty: bool,
@@ -114,6 +126,7 @@ impl Entity {
             kind,
             spawn_tick,
             awake: true,
+            state: 0,
             hp: 0,
             hp_dirty: false,
             ai: AiState::default(),
@@ -124,6 +137,7 @@ impl Entity {
         match self.kind {
             EntityKind::ItemDrop { .. } => hitbox::ITEM_DROP,
             EntityKind::FallingSand => hitbox::FALLING_TILE,
+            EntityKind::Npc { .. } => hitbox::PLAYER,
             EntityKind::Enemy(kind) => kind.data().size,
             EntityKind::Arrow { .. } => hitbox::ARROW,
             EntityKind::VoidSickle => hitbox::VOID_SICKLE,
@@ -170,12 +184,13 @@ impl EntityStore {
     }
 
     /// Spawn messages for every entity currently inside chunk `c` — sent to
-    /// players whose window just gained that chunk.
+    /// players whose window just gained that chunk. NPCs are skipped: their
+    /// roster (`NpcList`) goes to everyone regardless of chunk.
     pub fn spawn_messages_in_chunk(&self, c: (u32, u32)) -> Vec<ServerMessage> {
         self.map
             .iter()
             .filter(|(_, e)| e.chunk() == c)
-            .map(|(&id, e)| spawn_message(id, e))
+            .filter_map(|(&id, e)| spawn_message(id, e))
             .collect()
     }
 }
@@ -186,7 +201,9 @@ impl Default for EntityStore {
     }
 }
 
-pub(crate) fn spawn_message(id: u32, e: &Entity) -> ServerMessage {
+/// The wire announcement for one entity; `None` for kinds that announce
+/// through another channel (NPCs → `NpcList`).
+pub(crate) fn spawn_message(id: u32, e: &Entity) -> Option<ServerMessage> {
     use ferraria_shared::protocol::EntityKind as Wire;
     let wire = |kind: Wire| ServerMessage::EntitySpawn {
         id,
@@ -196,21 +213,22 @@ pub(crate) fn spawn_message(id: u32, e: &Entity) -> ServerMessage {
         state: 0,
     };
     match e.kind {
-        EntityKind::ItemDrop { item, count } => ServerMessage::ItemDropSpawn {
+        EntityKind::ItemDrop { item, count } => Some(ServerMessage::ItemDropSpawn {
             id,
             item,
             count,
             pos: e.pos,
             vel: e.vel,
-        },
-        EntityKind::FallingSand => wire(Wire::FallingSand),
-        EntityKind::Enemy(kind) => wire(kind.wire_kind()),
-        EntityKind::Arrow { item, .. } => wire(if item == ItemId::FlamingArrow {
+        }),
+        EntityKind::FallingSand => Some(wire(Wire::FallingSand)),
+        EntityKind::Npc { .. } => None,
+        EntityKind::Enemy(kind) => Some(wire(kind.wire_kind())),
+        EntityKind::Arrow { item, .. } => Some(wire(if item == ItemId::FlamingArrow {
             Wire::FlamingArrowProjectile
         } else {
             Wire::ArrowProjectile
-        }),
-        EntityKind::VoidSickle => wire(Wire::VoidSickleProjectile),
+        })),
+        EntityKind::VoidSickle => Some(wire(Wire::VoidSickleProjectile)),
     }
 }
 
@@ -261,8 +279,9 @@ impl Sim {
             self.tick,
         );
         let id = self.entities.insert(entity);
-        let msg = spawn_message(id, &entity);
-        self.broadcast_at(x, y, &msg);
+        if let Some(msg) = spawn_message(id, &entity) {
+            self.broadcast_at(x, y, &msg);
+        }
         id
     }
 
@@ -284,8 +303,9 @@ impl Sim {
             spawn_tick,
         );
         let id = self.entities.insert(entity);
-        let msg = spawn_message(id, &entity);
-        self.broadcast_at(center.0.max(0.0) as u32, center.1.max(0.0) as u32, &msg);
+        if let Some(msg) = spawn_message(id, &entity) {
+            self.broadcast_at(center.0.max(0.0) as u32, center.1.max(0.0) as u32, &msg);
+        }
         id
     }
 
@@ -491,13 +511,18 @@ impl Sim {
     }
 
     /// Snapshot batch (every 3 ticks): awake entities only, filtered per
-    /// player to their chunk window.
+    /// player to their chunk window. NPCs are exempt from the awake gate:
+    /// a night-sheltered NPC moves nothing for minutes, but players whose
+    /// chunk window re-gains the town (NPCs get no `spawn_message` re-sync)
+    /// must still receive its authoritative position, or talk/heal/shop
+    /// intents aimed at the stale ghost silently fail the server's range
+    /// check. Three NPCs at 20/s is negligible wire cost.
     pub(crate) fn broadcast_entity_updates(&mut self) {
         let states: Vec<((u32, u32), EntityState)> = self
             .entities
             .map
             .iter()
-            .filter(|(_, e)| e.awake)
+            .filter(|(_, e)| e.awake || matches!(e.kind, EntityKind::Npc { .. }))
             .map(|(&id, e)| {
                 (
                     e.chunk(),
@@ -506,7 +531,7 @@ impl Sim {
                         pos: e.pos,
                         vel: e.vel,
                         hp: e.hp_dirty.then_some(e.hp),
-                        state: 0,
+                        state: e.state,
                     },
                 )
             })
@@ -766,8 +791,13 @@ mod tests {
         sim.spawn_item_drop_exact(ItemId::Wood, 1, (60.5, FLOOR as f32 - 0.5), (0.0, 0.0), 100);
         sim.spawn_item_drop_exact(ItemId::Wood, 1, (61.0, FLOOR as f32 - 0.5), (0.0, 0.0), 900);
         advance(&mut sim, 2);
-        let survivor = sim.entities.map.values().next().expect("merged survivor");
-        assert_eq!(sim.entities.map.len(), 1);
-        assert_eq!(survivor.spawn_tick, 100, "despawn timer not reset");
+        let drops: Vec<&Entity> = sim
+            .entities
+            .map
+            .values()
+            .filter(|e| matches!(e.kind, EntityKind::ItemDrop { .. }))
+            .collect();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].spawn_tick, 100, "despawn timer not reset");
     }
 }

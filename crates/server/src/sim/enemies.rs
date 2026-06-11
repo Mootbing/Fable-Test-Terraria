@@ -40,13 +40,11 @@ impl Sim {
             .count() as u32
     }
 
-    /// Town NPC positions for §5.3 step 3 spawn suppression.
-    ///
-    /// INTEGRATE(town-suppression): the NPC branch implements town NPCs;
-    /// merge by returning their positions here. Until then there are no
-    /// town NPCs, so suppression is a no-op.
-    pub(crate) fn town_npc_positions(&self) -> &[(f32, f32)] {
-        &[]
+    /// Town NPC centers for §5.3 step 3 spawn suppression (the live §7
+    /// roster — dead NPCs leave the map until their dawn respawn, so they
+    /// stop suppressing).
+    pub(crate) fn town_npc_positions(&self) -> Vec<(f32, f32)> {
+        self.town.npcs.values().map(|n| n.center()).collect()
     }
 
     /// §5.3: one spawn evaluation per player per tick.
@@ -170,6 +168,7 @@ impl Sim {
             kind: EntityKind::Enemy(kind),
             spawn_tick: self.tick,
             awake: true,
+            state: 0,
             hp: data.max_hp,
             hp_dirty: false,
             ai: AiState {
@@ -182,8 +181,9 @@ impl Sim {
             },
         };
         let id = self.entities.insert(entity);
-        let msg = spawn_message(id, &entity);
-        self.broadcast_at(pos.0.max(0.0) as u32, pos.1.max(0.0) as u32, &msg);
+        if let Some(msg) = spawn_message(id, &entity) {
+            self.broadcast_at(pos.0.max(0.0) as u32, pos.1.max(0.0) as u32, &msg);
+        }
         id
     }
 
@@ -774,6 +774,7 @@ mod tests {
             kind: EntityKind::Enemy(kind),
             spawn_tick: 0,
             awake: true,
+            state: 0,
             hp: kind.data().max_hp,
             hp_dirty: false,
             ai: AiState {

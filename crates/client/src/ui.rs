@@ -9,6 +9,7 @@
 //! (Tooltips allocate while hovering — one small panel at most.)
 
 pub mod crafting;
+pub mod dialogue;
 pub mod inventory;
 
 use std::collections::VecDeque;

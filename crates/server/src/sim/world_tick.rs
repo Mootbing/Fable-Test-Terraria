@@ -770,7 +770,13 @@ mod tests {
         sim.random_tick_cell(x, y);
         assert_eq!(sim.world().tile(x, y).id, TileId::Air, "snuffed out");
         // The torch pops out as a drop.
-        assert_eq!(sim.entities.map.len(), 1);
+        let drops = sim
+            .entities
+            .map
+            .values()
+            .filter(|e| matches!(e.kind, EntityKind::ItemDrop { .. }))
+            .count();
+        assert_eq!(drops, 1);
     }
 
     #[test]

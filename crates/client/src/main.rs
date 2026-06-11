@@ -7,17 +7,20 @@
 //! - [`world_view`] — mirror of the server world (chunks + tile deltas).
 //! - [`player`] — own-player prediction, remote-player interpolation.
 //! - [`entities`] — mirror of server entities (item drops, later enemies).
+//! - [`npcs`] — town NPC mirror + rendering (DESIGN §7).
 //! - [`interact`] — mouse aiming, mining/placing intents, crack overlay.
 //! - [`light`] — client-side flood-fill lighting + day/night sky ramp.
 //! - [`render`] — camera, sky, tiles, player sprites.
 //! - [`ui`] — menus, HUD, chat, debug overlay (`ui::inventory`,
-//!   `ui::crafting`: hotbar + inventory screen, crafting panel).
+//!   `ui::crafting`: hotbar + inventory screen, crafting panel;
+//!   `ui::dialogue`: NPC dialogue panel + merchant shop).
 
 mod app;
 mod entities;
 mod interact;
 mod light;
 mod net;
+mod npcs;
 mod player;
 mod render;
 mod ui;

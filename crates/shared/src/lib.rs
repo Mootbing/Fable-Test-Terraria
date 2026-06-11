@@ -7,12 +7,14 @@
 //! Gameplay numbers live in the data tables and constants, sourced from
 //! DESIGN.md; don't inline them elsewhere.
 
+pub mod coins;
 pub mod crafting;
 pub mod enemies;
 pub mod inventory_ops;
 pub mod items;
 pub mod loadout;
 mod macros;
+pub mod npc;
 pub mod physics;
 pub mod protocol;
 pub mod rng;
