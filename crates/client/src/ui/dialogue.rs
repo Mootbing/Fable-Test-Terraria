@@ -131,8 +131,8 @@ impl DialogueUi {
     pub fn frame(
         &mut self,
         inv: &[Option<InvSlot>],
-        own_hp: u32,
-        own_max_hp: u32,
+        own_hp: u16,
+        own_max_hp: u16,
         debuffs: &[ActiveDebuff],
         flags: WorldFlags,
         now: f64,
@@ -189,7 +189,7 @@ impl DialogueUi {
                     ("Heal (healthy)".to_string(), false)
                 } else {
                     let cost = nurse_heal_cost(
-                        hp_restored,
+                        hp_restored as u32,
                         cleared,
                         flags.watcher_defeated,
                         flags.bone_warden_defeated,

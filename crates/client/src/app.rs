@@ -10,10 +10,13 @@ use ferraria_shared::crafting::stations_in_range;
 use ferraria_shared::items::{inventory, ArmorSlot, InvSlot, ItemId};
 use ferraria_shared::loadout;
 use ferraria_shared::physics::{PhysicsMods, PlayerInput, PLAYER_HEIGHT, PLAYER_WIDTH};
-use ferraria_shared::protocol::{ActiveDebuff, AuthToken, ClientMessage, ServerMessage};
+use ferraria_shared::protocol::{ActiveDebuff, AuthToken, ClientMessage, Debuff, ServerMessage};
 use ferraria_shared::tiles::{TileId, MINING_HELMET_LIGHT, PLAYER_GLOW};
 use ferraria_shared::world::{chest_in_reach, WorldFlags, DAY_TICKS};
-use ferraria_shared::{MAX_NAME_CHARS, PLAYER_BASE_MAX_HP, PROTOCOL_VERSION, TICK_RATE, TILE_SIZE};
+use ferraria_shared::{
+    DARKNESS_LIGHT_RADIUS_MULT, MAX_NAME_CHARS, PLAYER_BASE_MAX_HP, PLAYER_MAX_BREATH,
+    PROTOCOL_VERSION, RESPAWN_SECS, TICK_RATE, TILE_SIZE,
+};
 
 use crate::entities::Entities;
 use crate::interact::Interact;
@@ -281,16 +284,26 @@ struct Session {
     craft_ui: CraftingUi,
     /// Mirror of the open chest (panel shows while `Some`).
     chest: Option<ChestMirror>,
+    /// Server-authoritative own vitals (§8), mirrored for the HUD:
+    /// `PlayerHealth` / `PlayerBreath` deltas. Also drives the Nurse cost
+    /// preview (§7.4).
+    hp: u16,
+    max_hp: u16,
+    breath: u16,
+    /// Own active debuffs — the `PlayerDebuffs` replacement list plus its
+    /// arrival time, so the HUD timers and the §10 Darkness light dimming
+    /// count the synced ticks down locally (the Nurse preview reads it too).
+    debuffs: Vec<ActiveDebuff>,
+    debuffs_at: f64,
+    /// Dead (§8): set by `PlayerDied`, cleared by `PlayerRespawned`. Gates
+    /// movement and world interaction — the server drops both from corpses.
+    dead: bool,
+    died_at: f64,
     /// World progress flags (bosses defeated): Nurse cost preview (§7.4).
     flags: WorldFlags,
     /// Town NPC mirror + the dialogue/shop UI (§7).
     npcs: Npcs,
     dialogue: DialogueUi,
-    /// Own HP, synced by `PlayerHealth` — drives the Nurse cost preview.
-    own_hp: u32,
-    own_max_hp: u32,
-    /// Own active debuffs, synced by `PlayerDebuffs` (Nurse preview §7.4).
-    own_debuffs: Vec<ActiveDebuff>,
 }
 
 impl Session {
@@ -330,13 +343,26 @@ impl Session {
             inv_ui: InventoryUi::new(),
             craft_ui: CraftingUi::new(),
             chest: None,
+            hp: PLAYER_BASE_MAX_HP as u16,
+            max_hp: PLAYER_BASE_MAX_HP as u16,
+            breath: PLAYER_MAX_BREATH as u16,
+            debuffs: Vec::new(),
+            debuffs_at: 0.0,
+            dead: false,
+            died_at: f64::NEG_INFINITY,
             flags: welcome.flags,
             npcs: Npcs::new(),
             dialogue: DialogueUi::new(),
-            own_hp: PLAYER_BASE_MAX_HP,
-            own_max_hp: PLAYER_BASE_MAX_HP,
-            own_debuffs: Vec::new(),
         }
+    }
+
+    /// Whether the own player's Darkness debuff (§5.2) is still running —
+    /// halves the own light emission (§10).
+    fn has_darkness(&self, now: f64) -> bool {
+        self.debuffs.iter().any(|d| {
+            d.debuff == Debuff::Darkness
+                && d.remaining_ticks as f64 / TICK_RATE as f64 > now - self.debuffs_at
+        })
     }
 
     /// One frame while Playing. Returns a reason to move to Disconnected.
@@ -360,7 +386,8 @@ impl Session {
         if let Some(text) = self.chat.handle_input() {
             self.ws.send(&ClientMessage::Chat { text });
         }
-        let input = if self.chat.open {
+        // Dead players don't move (the server drops their `PlayerState`s).
+        let input = if self.chat.open || self.dead {
             PlayerInput::default()
         } else {
             gather_input()
@@ -370,11 +397,12 @@ impl Session {
         }
 
         // 3. Own-player prediction at a fixed 60 Hz, frozen until the chunk
-        // under us has streamed in. Equipment modifiers (Swift Boots, Gust
-        // Jar...) come from the synced inventory via the shared loadout fn,
-        // so the server agrees with what we predict.
+        // under us has streamed in (and while dead — the body is gone).
+        // Equipment modifiers (Swift Boots, Gust Jar...) come from the
+        // synced inventory via the shared loadout fn, so the server agrees
+        // with what we predict.
         let center = self.own.phys.center();
-        let frozen = !self.view.chunk_loaded_at(center.0, center.1);
+        let frozen = self.dead || !self.view.chunk_loaded_at(center.0, center.1);
         for msg in self
             .own
             .update(self.view.world(), input, dt, frozen, self.mods)
@@ -411,15 +439,16 @@ impl Session {
             dt,
         );
 
-        // 4.5. Mouse world interaction (mining/placing/doors/chests) with
-        // the fresh camera. Quiet while chat owns the keyboard or the
+        // 4.5. Mouse world interaction (mining/placing/combat/doors/chests)
+        // with the fresh camera. Quiet while chat owns the keyboard, the
         // inventory screen / dialogue panel owns the mouse (slot clicks and
-        // Heal/Shop-button clicks must not swing or place). A right-click
+        // Heal/Shop-button clicks must not swing or place), or we're dead
+        // (§8: the dispatch gate drops world intents anyway). A right-click
         // on a hovered in-range NPC talks instead (§7.4 "Right-click →
         // Heal" is this path on the Nurse) and outranks the tile behind it.
         let tl = self.camera.top_left();
         let aim = Interact::aim(self.view.world(), tl);
-        if !self.chat.open && !self.inv_ui.open && !self.dialogue.is_open() {
+        if !self.chat.open && !self.inv_ui.open && !self.dialogue.is_open() && !self.dead {
             let (mx, my) = mouse_position();
             let cursor = ((mx + tl.x) / TILE_SIZE, (my + tl.y) / TILE_SIZE);
             let hovered_npc = self
@@ -437,7 +466,9 @@ impl Session {
                 &self.inventory,
                 self.selected,
                 aim,
+                Interact::mouse_world(tl),
                 hovered_npc.is_some(),
+                now,
                 dt,
             );
         }
@@ -448,13 +479,16 @@ impl Session {
         let render_t = now - INTERP_DELAY;
         self.remote_samples.clear();
         for (&id, remote) in self.remotes.iter_mut() {
+            if remote.dead {
+                continue; // hidden until PlayerRespawned (§8)
+            }
             self.remote_samples.push((id, remote.sample(render_t)));
         }
         // Stable order: dynamic sources are compared against last frame's to
         // skip recomputes, which map iteration order must not defeat.
         self.remote_samples.sort_by_key(|&(id, _)| id);
         let ticks = self.clock.ticks();
-        self.gather_light_sources();
+        self.gather_light_sources(now);
         let view_rect = self.camera.visible_tiles(self.view.world());
         let abs_tick = self.clock.day as u64 * DAY_TICKS as u64 + ticks as u64;
         let t0 = get_time();
@@ -485,8 +519,9 @@ impl Session {
             let Some(remote) = self.remotes.get(&id) else {
                 continue;
             };
+            let px = vec2(s.pos.0 * TILE_SIZE - tl.x, s.pos.1 * TILE_SIZE - tl.y);
             render::draw_player(&PlayerDraw {
-                pos: vec2(s.pos.0 * TILE_SIZE - tl.x, s.pos.1 * TILE_SIZE - tl.y),
+                pos: px,
                 world_x: s.pos.0,
                 vel_x: s.vel.0,
                 facing: s.facing,
@@ -494,30 +529,44 @@ impl Session {
                 name: &remote.name,
                 is_self: false,
                 held_item: remote.held_item,
+                swing: None,
                 light: self
                     .light
                     .brightness_at(s.pos.0 + PLAYER_WIDTH / 2.0, s.pos.1 + PLAYER_HEIGHT / 2.0),
             });
+            // Hurt teammates get the same floating bar as enemies, above
+            // their name label.
+            if remote.hp < remote.max_hp {
+                crate::entities::draw_health_bar(
+                    px.x + PLAYER_WIDTH * TILE_SIZE / 2.0,
+                    px.y - 26.0,
+                    remote.hp as f32 / remote.max_hp.max(1) as f32,
+                    1.0,
+                );
+            }
         }
-        let p = &self.own.phys;
-        let own_center = p.center();
-        render::draw_player(&PlayerDraw {
-            pos: vec2(p.pos.0 * TILE_SIZE - tl.x, p.pos.1 * TILE_SIZE - tl.y),
-            world_x: p.pos.0,
-            vel_x: p.vel.0,
-            facing: self.own.facing,
-            anim: self.own.anim_flags(),
-            name: &self.name,
-            is_self: true,
-            held_item: self
-                .inventory
-                .get(self.selected as usize)
-                .copied()
-                .flatten()
-                .map(|s| s.item),
-            light: self.light.brightness_at(own_center.0, own_center.1),
-        });
-        self.interact.draw_aim(aim, center, tl);
+        let own_center = self.own.phys.center();
+        if !self.dead {
+            let p = &self.own.phys;
+            render::draw_player(&PlayerDraw {
+                pos: vec2(p.pos.0 * TILE_SIZE - tl.x, p.pos.1 * TILE_SIZE - tl.y),
+                world_x: p.pos.0,
+                vel_x: p.vel.0,
+                facing: self.own.facing,
+                anim: self.own.anim_flags(),
+                name: &self.name,
+                is_self: true,
+                held_item: self
+                    .inventory
+                    .get(self.selected as usize)
+                    .copied()
+                    .flatten()
+                    .map(|s| s.item),
+                swing: self.interact.swing(now),
+                light: self.light.brightness_at(own_center.0, own_center.1),
+            });
+            self.interact.draw_aim(aim, center, tl);
+        }
         // Night vignette, surface only (skip when buried — caves are dark
         // everywhere, the edges shouldn't be extra-dark).
         let own_tile = (own_center.0 as u32, own_center.1 as u32);
@@ -525,11 +574,21 @@ impl Session {
             render::draw_vignette(1.0 - light::daylight(ticks), &mut self.batch);
         }
 
-        // 7. Overlay UI: HUD, then the inventory screen (hotbar always; full
-        // panels + crafting + chest while open), then chat on top. World
-        // right-clicks (doors, chests) are `Interact`'s job in step 4.5.
+        // 7. Overlay UI: HUD (top-left status + top-right §8 survival
+        // block), then the inventory screen (hotbar always; full panels +
+        // crafting + chest while open), the death overlay, then chat on
+        // top. World right-clicks (doors, chests) are `Interact`'s job in
+        // step 4.5.
         self.hud
             .draw(self.remotes.len() + 1, self.clock.day, self.clock.ticks());
+        self.hud.draw_survival(
+            self.hp,
+            self.max_hp,
+            self.breath,
+            &self.debuffs,
+            self.debuffs_at,
+            now,
+        );
         let mut ui_msgs: Vec<ClientMessage> = Vec::new();
         let sell = self.dialogue.sell_target();
         // A drag-drop that lands a carried stack spends its LMB press: the
@@ -550,9 +609,9 @@ impl Session {
         // NPC dialogue panel + merchant shop window (§7.3–§7.5).
         let shop_opened = self.dialogue.frame(
             &self.inventory,
-            self.own_hp,
-            self.own_max_hp,
-            &self.own_debuffs,
+            self.hp,
+            self.max_hp,
+            &self.debuffs,
             self.flags,
             now,
             click_spent,
@@ -568,6 +627,15 @@ impl Session {
         }
         for msg in ui_msgs {
             self.ws.send(&msg);
+        }
+        // Death screen (§8): dim everything, offer Respawn once the 10 s
+        // timer (mirrored client-side) has run. The server gates the intent
+        // too, so an early click is merely ignored.
+        if self.dead {
+            let secs_left = RESPAWN_SECS as f64 - (now - self.died_at);
+            if ui::draw_death_screen(secs_left) {
+                self.ws.send(&ClientMessage::Respawn);
+            }
         }
         self.chat.draw(now);
         if self.hud.debug {
@@ -586,39 +654,45 @@ impl Session {
 
     /// Collects this frame's non-tile light sources (§10): every player
     /// glows 4 at their center tile; a worn Mining Helmet emits 20 at the
-    /// own player's head. Remote helmets aren't knowable yet — the server
-    /// doesn't broadcast worn armor (only held items); if that lands, hook
-    /// it in here.
-    fn gather_light_sources(&mut self) {
+    /// own player's head. A Darkness victim's emission is halved
+    /// (§5.2/§10: light radius halved — flood-fill radius scales with the
+    /// source level), own and remote alike. Dead players emit nothing.
+    /// Remote helmets aren't knowable yet — the server doesn't broadcast
+    /// worn armor (only held items); if that lands, hook it in here.
+    fn gather_light_sources(&mut self, now: f64) {
         self.sources.clear();
-        let center = self.own.phys.center();
-        self.sources.push(DynamicSource {
-            x: center.0 as i32,
-            y: center.1 as i32,
-            level: PLAYER_GLOW,
-        });
-        // Specifically the head slot (§10 ties the light to *wearing* the
-        // helmet): inventory slot `ARMOR_START + k`, in `ArmorSlot`
-        // declaration order (Head, Chest, Legs).
-        let head = self
-            .inventory
-            .get(inventory::ARMOR_START + ArmorSlot::Head as usize)
-            .copied()
-            .flatten()
-            .map(|s| s.item);
-        if head == Some(ItemId::MiningHelmet) {
-            let head_y = self.own.phys.pos.1 + render::HEAD_CENTER_PX / TILE_SIZE;
+        if !self.dead {
+            let dark = self.has_darkness(now);
+            let center = self.own.phys.center();
             self.sources.push(DynamicSource {
                 x: center.0 as i32,
-                y: head_y as i32,
-                level: MINING_HELMET_LIGHT,
+                y: center.1 as i32,
+                level: dimmed(PLAYER_GLOW, dark),
             });
+            // Specifically the head slot (§10 ties the light to *wearing*
+            // the helmet): inventory slot `ARMOR_START + k`, in `ArmorSlot`
+            // declaration order (Head, Chest, Legs).
+            let head = self
+                .inventory
+                .get(inventory::ARMOR_START + ArmorSlot::Head as usize)
+                .copied()
+                .flatten()
+                .map(|s| s.item);
+            if head == Some(ItemId::MiningHelmet) {
+                let head_y = self.own.phys.pos.1 + render::HEAD_CENTER_PX / TILE_SIZE;
+                self.sources.push(DynamicSource {
+                    x: center.0 as i32,
+                    y: head_y as i32,
+                    level: dimmed(MINING_HELMET_LIGHT, dark),
+                });
+            }
         }
-        for &(_, s) in &self.remote_samples {
+        for &(id, s) in &self.remote_samples {
+            let dark = self.remotes.get(&id).is_some_and(|r| r.has_darkness(now));
             self.sources.push(DynamicSource {
                 x: (s.pos.0 + PLAYER_WIDTH / 2.0) as i32,
                 y: (s.pos.1 + PLAYER_HEIGHT / 2.0) as i32,
-                level: PLAYER_GLOW,
+                level: dimmed(PLAYER_GLOW, dark),
             });
         }
     }
@@ -743,8 +817,11 @@ impl Session {
                 self.npcs.update(&entities, now);
                 self.entities.update(&entities, now);
             }
-            ServerMessage::EntityDespawn { id, .. } => {
-                self.entities.remove(id);
+            ServerMessage::EntityHurt { id, damage, crit } => {
+                self.entities.on_hurt(id, damage, crit, now)
+            }
+            ServerMessage::EntityDespawn { id, reason } => {
+                self.entities.on_despawn(id, reason, now);
                 self.npcs.remove(id);
                 if self.dialogue.npc_id() == Some(id) {
                     self.dialogue.close();
@@ -799,6 +876,59 @@ impl Session {
                     remote.held_item = item;
                 }
             }
+            ServerMessage::PlayerHealth { id, hp, max_hp } => {
+                if id == self.own_id {
+                    self.hp = hp;
+                    self.max_hp = max_hp;
+                } else if let Some(remote) = self.remotes.get_mut(&id) {
+                    remote.hp = hp;
+                    remote.max_hp = max_hp;
+                }
+            }
+            ServerMessage::PlayerBreath { id, breath } => {
+                if id == self.own_id {
+                    self.breath = breath;
+                }
+            }
+            ServerMessage::PlayerDebuffs { id, debuffs } => {
+                if id == self.own_id {
+                    self.debuffs = debuffs;
+                    self.debuffs_at = now;
+                } else if let Some(remote) = self.remotes.get_mut(&id) {
+                    remote.set_debuffs(&debuffs, now);
+                }
+            }
+            // Movement is client-authoritative, so the server can't shove
+            // us itself — it asks (protocol.rs), and we add the impulse to
+            // the predicted velocity.
+            ServerMessage::PlayerKnockback { vx, vy } => self.own.apply_knockback(vx, vy),
+            ServerMessage::PlayerDied { id } => {
+                if id == self.own_id {
+                    self.dead = true;
+                    self.died_at = now;
+                } else if let Some(remote) = self.remotes.get_mut(&id) {
+                    remote.dead = true; // hidden until PlayerRespawned
+                }
+            }
+            ServerMessage::PlayerRespawned { id, pos } => {
+                if id == self.own_id {
+                    self.dead = false;
+                    // The server silently restored the breath meter (§8);
+                    // debuffs were already cleared via PlayerDebuffs.
+                    self.breath = PLAYER_MAX_BREATH as u16;
+                    // Adopt the respawn point outright and recenter the
+                    // camera, mirroring the own-id `PlayerMoved` correction
+                    // snap — smoothing would pan across unloaded world.
+                    self.own.apply_correction(pos, (0.0, 0.0));
+                    let center = self.own.phys.center();
+                    let bounds = world_px(&self.view);
+                    self.camera
+                        .snap(vec2(center.0, center.1) * TILE_SIZE, bounds);
+                } else if let Some(remote) = self.remotes.get_mut(&id) {
+                    remote.dead = false;
+                    remote.reset_to(pos, now);
+                }
+            }
             ServerMessage::Chat { from, text } => self.chat.push_message(&from, &text, now),
             ServerMessage::Toast { text } => self.chat.push_system(text, now),
             ServerMessage::TimeSync { time, day } => self.clock.set(time, day),
@@ -834,25 +964,26 @@ impl Session {
             ServerMessage::ShopContents { npc_id, items } => {
                 self.dialogue.set_shop(npc_id, items);
             }
-            ServerMessage::PlayerHealth { id, hp, max_hp } => {
-                if id == self.own_id {
-                    self.own_hp = hp as u32;
-                    self.own_max_hp = max_hp as u32;
-                }
-            }
-            ServerMessage::PlayerDebuffs { id, debuffs } => {
-                if id == self.own_id {
-                    self.own_debuffs = debuffs;
-                }
-            }
             ServerMessage::WorldFlags { flags } => self.flags = flags,
+            // Session-layer messages, consumed before `apply` (`Reject`/
+            // `Welcome`) or by the ping loop (`Pong`). The match is
+            // exhaustive on purpose: a new protocol variant must be wired
+            // (or parked here) explicitly.
             ServerMessage::Reject { .. }
             | ServerMessage::Welcome { .. }
             | ServerMessage::Pong { .. } => {}
-            // Combat-side messages (deaths, respawns, breath) render with
-            // the enemies branch.
-            _ => {}
         }
+    }
+}
+
+/// §10/§5.2: a Darkness victim's light emission is halved (flood-fill
+/// radius scales with the source level, so halving the level halves the
+/// radius).
+fn dimmed(level: u8, darkness: bool) -> u8 {
+    if darkness {
+        (level as f32 * DARKNESS_LIGHT_RADIUS_MULT) as u8
+    } else {
+        level
     }
 }
 

@@ -41,7 +41,7 @@ use ferraria_shared::{
 use super::entities::EntityStore;
 use super::fluids::FluidSim;
 use super::interact::TileDamage;
-use super::npc::{DebuffSet, TownState};
+use super::npc::TownState;
 
 /// One encoded `ServerMessage`, shared between sessions without re-encoding.
 pub type Frame = Arc<[u8]>;
@@ -99,10 +99,10 @@ pub(crate) struct Player {
     /// Top-left of the AABB, tile units (the `PlayerState` convention).
     pub(crate) pos: (f32, f32),
     pub(crate) vel: (f32, f32),
-    facing: i8,
-    anim: u8,
+    pub(crate) facing: i8,
+    pub(crate) anim: u8,
     /// Movement changed since the last snapshot broadcast.
-    moved: bool,
+    pub(crate) moved: bool,
     pub(crate) held_slot: u8,
     /// Flat §8 layout (`items::inventory`), server-authoritative.
     pub(crate) inventory: Vec<Option<InvSlot>>,
@@ -134,18 +134,30 @@ pub(crate) struct Player {
     last_held_broadcast_tick: Option<u64>,
     /// A coalesced selection broadcast is pending for this player.
     held_broadcast_dirty: bool,
-    /// §8 health. INTEGRATE(player-hp): the enemies/combat branch owns
-    /// damage, death, regen, and Life Crystal max-HP gains; this branch
-    /// stores HP so the Nurse (§7.4), her arrival condition (§7.2), and the
-    /// HP-gated dialogue (§7.5) work. The merge train should unify on one
-    /// pair of fields.
-    pub(crate) hp: u32,
-    pub(crate) max_hp: u32,
-    /// Debuff storage (see [`DebuffSet`] — INTEGRATE(nurse-debuffs)).
-    pub(crate) debuffs: DebuffSet,
-    /// §8 personal bed spawn: the bed's origin tile, validated again at
-    /// respawn time (`Sim::spawn_point_for`).
+    // ---- Survival/combat state (§8, sim::survival / sim::combat) ----------
+    pub(crate) hp: u16,
+    pub(crate) max_hp: u16,
+    pub(crate) dead: bool,
+    /// Tick the §8 respawn timer elapses (valid while `dead`).
+    pub(crate) respawn_ready_tick: u64,
+    /// §0 player i-frames: hits are ignored until this tick.
+    pub(crate) iframe_until: u64,
+    pub(crate) last_damage_tick: u64,
+    /// Fractional accumulators: passive regen, Burning DPS, drowning DPS.
+    pub(crate) regen_acc: f32,
+    pub(crate) burn_acc: f32,
+    pub(crate) drown_acc: f32,
+    /// §8 breath units (0..=PLAYER_MAX_BREATH).
+    pub(crate) breath: u16,
+    /// Active timed debuffs: (kind, remaining ticks).
+    pub(crate) debuffs: Vec<(ferraria_shared::protocol::Debuff, u32)>,
+    /// Server-observed fall tracking (see `sim::survival` module docs).
+    pub(crate) fall_accum: f32,
+    pub(crate) was_grounded: bool,
+    /// Personal bed spawn (§8), the bed's multitile origin.
     pub(crate) bed_spawn: Option<(u32, u32)>,
+    /// Live §4.1 melee arc, if mid-swing.
+    pub(crate) swing: Option<super::combat::MeleeSwing>,
     tx: mpsc::Sender<Frame>,
 }
 
@@ -164,6 +176,11 @@ impl Player {
             .flatten()
             .map(|s| s.item)
     }
+
+    /// Royal Gel Charm equipped (§4.3): green/blue slimes never aggro.
+    pub(crate) fn slime_friend(&self) -> bool {
+        ferraria_shared::loadout::effect_mods(&self.inventory).slime_friend
+    }
 }
 
 /// State retained for a disconnected player; `name` + `token` in a later
@@ -175,8 +192,8 @@ struct OfflinePlayer {
     pos: (f32, f32),
     held_slot: u8,
     inventory: Vec<Option<InvSlot>>,
-    hp: u32,
-    max_hp: u32,
+    hp: u16,
+    max_hp: u16,
     bed_spawn: Option<(u32, u32)>,
 }
 
@@ -216,8 +233,15 @@ pub struct Sim {
     pub(crate) saplings: HashMap<(u32, u32), u64>,
     /// Level-1 puddle cells → first-seen tick (§3 evaporation).
     pub(crate) puddles: HashMap<(u32, u32), u64>,
-    /// Loot/world-event randomness (pot rolls, acorn drops, spawn impulses).
+    /// Loot/world-event randomness (pot rolls, acorn drops, spawn impulses,
+    /// combat crit/proc rolls).
     pub(crate) loot_rng: Pcg32,
+    /// §5.3 spawn rolls and AI randomness.
+    pub(crate) spawn_rng: Pcg32,
+    /// Per-source enemy hit immunity (§0): `(entity, source)` → immune
+    /// until tick. [`super::combat::DamageSource`] keeps player-melee and
+    /// projectile windows in separate keyspaces (the raw ids overlap).
+    pub(crate) enemy_iframes: HashMap<(u32, super::combat::DamageSource), u64>,
     /// Cells changed by batched systems this tick, flushed as one
     /// [`ServerMessage::TilesChanged`] per subscribed player.
     tile_batch: Vec<(u32, u32)>,
@@ -252,6 +276,8 @@ impl Sim {
             saplings: HashMap::new(),
             puddles: HashMap::new(),
             loot_rng: Pcg32::new(entropy_seed() ^ 0x1007_caf3),
+            spawn_rng: Pcg32::new(entropy_seed() ^ 0x57a4_11fe),
+            enemy_iframes: HashMap::new(),
             tile_batch: Vec::new(),
             support_checks: Vec::new(),
             town: TownState::default(),
@@ -335,6 +361,15 @@ impl Sim {
         // the end of the tick.
         self.world_tick();
         self.tick_entities();
+        // Enemies & combat (§5) and player survival (§8).
+        self.tick_enemy_spawning();
+        self.tick_enemies();
+        self.tick_projectiles();
+        self.tick_swings();
+        self.tick_enemy_contact();
+        self.tick_player_vitals();
+        self.purge_enemy_iframes();
+        // Town NPCs (§7).
         self.tick_npcs();
         self.revalidate_supports();
 
@@ -347,8 +382,6 @@ impl Sim {
         if self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS as u64) {
             self.broadcast_entity_updates();
         }
-
-        // (Later PRs: enemies tick here.)
 
         self.flush_kicks();
     }
@@ -399,8 +432,8 @@ impl Sim {
                     pos: spawn_pos(&self.world),
                     held_slot: 0,
                     inventory: starting_inventory(),
-                    hp: PLAYER_BASE_MAX_HP,
-                    max_hp: PLAYER_BASE_MAX_HP,
+                    hp: PLAYER_BASE_MAX_HP as u16,
+                    max_hp: PLAYER_BASE_MAX_HP as u16,
                     bed_spawn: None,
                 }
             }
@@ -439,10 +472,21 @@ impl Sim {
             held_broadcast_dirty: false,
             hp,
             max_hp,
+            dead: false,
+            respawn_ready_tick: 0,
+            iframe_until: 0,
+            last_damage_tick: 0,
+            regen_acc: 0.0,
+            burn_acc: 0.0,
+            drown_acc: 0.0,
+            breath: ferraria_shared::PLAYER_MAX_BREATH as u16,
             // Debuffs don't survive a disconnect (they'd have ticked away
-            // offline anyway; INTEGRATE(nurse-debuffs)).
-            debuffs: DebuffSet::default(),
+            // offline anyway).
+            debuffs: Vec::new(),
+            fall_accum: 0.0,
+            was_grounded: true,
             bed_spawn,
+            swing: None,
             tx,
         };
 
@@ -458,6 +502,7 @@ impl Sim {
             slot: held_slot,
             item: player.held_item(),
         });
+        self.broadcast(&ServerMessage::PlayerHealth { id, hp, max_hp });
 
         // Queue the newcomer's join state in order: Welcome first, then the
         // player's own authoritative position, inventory, time, the
@@ -500,6 +545,7 @@ impl Sim {
                 day: self.world.day,
             })
             .into(),
+            encode(&ServerMessage::PlayerHealth { id, hp, max_hp }).into(),
         ];
         for (&oid, other) in &self.players {
             frames.push(
@@ -518,6 +564,14 @@ impl Sim {
                 })
                 .into(),
             );
+            frames.push(
+                encode(&ServerMessage::PlayerHealth {
+                    id: oid,
+                    hp: other.hp,
+                    max_hp: other.max_hp,
+                })
+                .into(),
+            );
         }
         for frame in frames {
             // Can only fail if the session already died; Disconnect follows.
@@ -533,14 +587,7 @@ impl Sim {
         // pre-NPC tests pin intact).
         let roster = self.npc_list_message();
         self.send_to(id, &roster);
-        self.send_to(
-            id,
-            &ServerMessage::PlayerHealth {
-                id,
-                hp: hp as u16,
-                max_hp: max_hp as u16,
-            },
-        );
+        self.send_to(id, &ServerMessage::PlayerHealth { id, hp, max_hp });
         let _ = reply.send(Ok((id, epoch)));
         tracing::info!(player = id, name = %name, "player joined");
     }
@@ -561,15 +608,27 @@ impl Sim {
             return; // disconnect raced a kick — already gone
         };
         tracing::info!(player = id, name = %p.name, "player left");
+        // A player who disconnects while dead reconnects respawned (bed or
+        // world spawn, §8 respawn HP).
+        let (pos, hp) = if p.dead {
+            (
+                p.bed_spawn
+                    .and_then(|o| super::survival::bed_spawn_pos(&self.world, o))
+                    .unwrap_or_else(|| super::survival::spawn_pos(&self.world)),
+                (ferraria_shared::PLAYER_BASE_MAX_HP.max(p.max_hp as u32 / 2) as u16).min(p.max_hp),
+            )
+        } else {
+            (p.pos, p.hp)
+        };
         self.offline.insert(
             p.name,
             OfflinePlayer {
                 id,
                 token: p.token,
-                pos: p.pos,
+                pos,
                 held_slot: p.held_slot,
                 inventory: p.inventory,
-                hp: p.hp,
+                hp,
                 max_hp: p.max_hp,
                 bed_spawn: p.bed_spawn,
             },
@@ -600,8 +659,8 @@ impl Sim {
     /// §7.2 "Any player has max HP > `hp`", online or parked offline (same
     /// no-double-count argument as [`Sim::combined_player_coins`]).
     pub(crate) fn any_player_max_hp_over(&self, hp: u32) -> bool {
-        self.players.values().any(|p| p.max_hp > hp)
-            || self.offline.values().any(|rec| rec.max_hp > hp)
+        self.players.values().any(|p| u32::from(p.max_hp) > hp)
+            || self.offline.values().any(|rec| u32::from(rec.max_hp) > hp)
     }
 
     fn flush_kicks(&mut self) {
@@ -623,6 +682,21 @@ impl Sim {
     fn handle_message(&mut self, id: u32, epoch: u64, msg: ClientMessage) {
         if self.players.get(&id).is_none_or(|p| p.epoch != epoch) {
             return; // message raced a disconnect, or is from a stale session
+        }
+        // Dead players (§8) can chat, ping, reorganize inventory, and ask to
+        // respawn — but can't act on the world.
+        if self.players.get(&id).is_some_and(|p| p.dead)
+            && !matches!(
+                msg,
+                ClientMessage::Ping { .. }
+                    | ClientMessage::Chat { .. }
+                    | ClientMessage::Respawn
+                    | ClientMessage::SelectSlot { .. }
+                    | ClientMessage::MoveSlot { .. }
+                    | ClientMessage::SplitSlot { .. }
+            )
+        {
+            return;
         }
         match msg {
             // The session layer consumed the real Hello; a duplicate is a
@@ -661,6 +735,8 @@ impl Sim {
                 inv_slot,
                 to_chest,
             } => self.chest_move_slot(id, chest_slot, inv_slot, to_chest),
+            ClientMessage::UseItem { slot, aim } => self.use_item(id, slot, aim),
+            ClientMessage::Respawn => self.respawn_player(id),
             ClientMessage::TalkNpc { npc_id } => self.talk_npc(id, npc_id),
             ClientMessage::BuyItem {
                 npc_id,
@@ -713,6 +789,7 @@ impl Sim {
             return;
         }
         p.move_budget -= (dx * dx + dy * dy).sqrt();
+        let old_pos = p.pos;
         p.pos = (
             pos.0.clamp(0.0, (w - PLAYER_WIDTH).max(0.0)),
             pos.1.clamp(0.0, (h - PLAYER_HEIGHT).max(0.0)),
@@ -724,6 +801,8 @@ impl Sim {
         p.facing = if facing < 0 { -1 } else { 1 };
         p.anim = anim;
         p.moved = true;
+        // Fall-damage observation (§8, sim::survival).
+        self.observe_movement(id, old_pos, anim);
     }
 
     fn select_slot(&mut self, id: u32, slot: u8) {
@@ -927,7 +1006,7 @@ impl Sim {
     /// Sends newly entered chunks and drops far ones, with hysteresis: a
     /// chunk is subscribed inside the 5×3 window but only unsubscribed once
     /// outside the (5+2)×(3+2) window.
-    fn update_player_chunks(&mut self, id: u32) {
+    pub(crate) fn update_player_chunks(&mut self, id: u32) {
         let (missing, keep_x, keep_y) = {
             let Some(p) = self.players.get(&id) else {
                 return;
@@ -1093,7 +1172,7 @@ pub async fn run(mut sim: Sim, mut rx: mpsc::Receiver<SimCommand>) {
 // ---- Pure helpers (unit-tested below) ----------------------------------------
 
 /// Initial AABB top-left for a player standing on the world spawn platform.
-fn spawn_pos(world: &World) -> (f32, f32) {
+pub(crate) fn spawn_pos(world: &World) -> (f32, f32) {
     // `spawn` is the air tile whose row below is the platform (worldgen pass
     // 12): feet rest on top of row `spawn.1 + 1`.
     PlayerPhysics::from_feet(world.spawn.0 as f32 + 0.5, (world.spawn.1 + 1) as f32).pos

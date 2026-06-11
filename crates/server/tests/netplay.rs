@@ -142,6 +142,10 @@ async fn connect_spawn_walk_chat_leave() {
             ServerMessage::TimeSync { .. } => time = true,
             // Authoritative own placement (used by reconnect reclaim).
             ServerMessage::PlayerMoved { id, pos, .. } if id == a_id => own_pos = Some(pos),
+            // §8 vitals arrive with the join state too.
+            ServerMessage::PlayerHealth { id, hp, max_hp } if id == a_id => {
+                assert_eq!((hp, max_hp), (100, 100), "fresh §8 HP");
+            }
             other => panic!("unexpected join frame {other:?}"),
         }
     }

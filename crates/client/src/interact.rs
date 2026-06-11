@@ -1,6 +1,7 @@
-//! Mouse-driven world interaction: tile aiming, hold-LMB mining at the held
-//! tool's §4.1 cadence, RMB placing/doors/chests, and the mining-crack
-//! overlay fed by `ServerMessage::BlockCrack`.
+//! Mouse-driven world interaction: tile aiming, hold-LMB mining (or weapon
+//! swings/bow shots, §4.1) at the held item's use cadence, RMB
+//! placing/doors/chests, and the mining-crack overlay fed by
+//! `ServerMessage::BlockCrack`.
 //!
 //! Everything here is *intent only* — the server revalidates reach, swing
 //! rate, and placement rules; this module just avoids sending obviously
@@ -10,7 +11,9 @@ use std::collections::HashMap;
 
 use macroquad::prelude::*;
 
-use ferraria_shared::items::{InvSlot, ItemId, Placement, BARE_HAND_USE_SECS};
+use ferraria_shared::items::{
+    inventory, InvSlot, ItemId, Placement, WeaponKind, BARE_HAND_USE_SECS,
+};
 use ferraria_shared::protocol::ClientMessage;
 use ferraria_shared::tiles::{state, TileId, ToolKind, WallId, TILE_DAMAGE_RESET_SECS};
 use ferraria_shared::world::World;
@@ -29,13 +32,16 @@ const CRACK_COLOR: Color = Color::new(0.05, 0.05, 0.05, 0.85);
 const AIM_OK: Color = Color::new(1.0, 1.0, 0.85, 0.85);
 const AIM_FAR: Color = Color::new(0.95, 0.25, 0.2, 0.85);
 
-/// Mining/placing input state + the crack overlay mirror.
+/// Mining/placing input state + the crack overlay mirror + the combat-use
+/// state (swing/bow animation timing for the own player).
 pub struct Interact {
     /// Per-cell crack: damage fraction (0–255) and arrival time (cracks
     /// expire after the §2 5 s damage decay, mirroring the server).
     cracks: HashMap<(u32, u32), (u8, f64)>,
     swing_cd: f32,
     place_cd: f32,
+    /// Live use animation: (start time, duration, is_bow).
+    swing_anim: Option<(f64, f64, bool)>,
 }
 
 impl Interact {
@@ -44,7 +50,24 @@ impl Interact {
             cracks: HashMap::new(),
             swing_cd: 0.0,
             place_cd: 0.0,
+            swing_anim: None,
         }
+    }
+
+    /// Progress (0..1) of the live swing/draw animation, and whether it's a
+    /// bow. `None` once it finished.
+    pub fn swing(&self, now: f64) -> Option<(f32, bool)> {
+        let (start, dur, bow) = self.swing_anim?;
+        let p = ((now - start) / dur) as f32;
+        (p < 1.0).then_some((p.max(0.0), bow))
+    }
+
+    /// Starts the held item's shared §4.1 use cooldown (one limiter across
+    /// mining and weapon swings, like the server's) and its animation.
+    fn start_use(&mut self, held: Option<ItemId>, now: f64, is_bow: bool) {
+        let secs = use_secs(held);
+        self.swing_cd = secs;
+        self.swing_anim = Some((now, secs as f64, is_bow));
     }
 
     pub fn on_block_crack(&mut self, x: u32, y: u32, damage_frac: u8, now: f64) {
@@ -56,11 +79,19 @@ impl Interact {
         self.cracks.remove(&(x, y));
     }
 
+    /// Mouse position in world tile coordinates (unclamped — also the
+    /// `UseItem` aim, which doesn't need to land on a world cell).
+    pub fn mouse_world(cam_top_left: Vec2) -> (f32, f32) {
+        let (mx, my) = mouse_position();
+        (
+            (mx + cam_top_left.x) / TILE_SIZE,
+            (my + cam_top_left.y) / TILE_SIZE,
+        )
+    }
+
     /// The world tile under the mouse (`None` outside the world).
     pub fn aim(world: &World, cam_top_left: Vec2) -> Option<(u32, u32)> {
-        let (mx, my) = mouse_position();
-        let wx = (mx + cam_top_left.x) / TILE_SIZE;
-        let wy = (my + cam_top_left.y) / TILE_SIZE;
+        let (wx, wy) = Interact::mouse_world(cam_top_left);
         if wx < 0.0 || wy < 0.0 {
             return None;
         }
@@ -68,8 +99,10 @@ impl Interact {
         world.in_bounds(x, y).then_some((x, y))
     }
 
-    /// Handles this frame's mouse input: hold-LMB mining at the held tool's
-    /// cadence, RMB door/chest interaction and hold-to-place.
+    /// Handles this frame's mouse input: hold-LMB mining or weapon use at
+    /// the held item's §4.1 cadence, RMB door/chest interaction and
+    /// hold-to-place. `aim_pos` is the raw mouse position in world tiles
+    /// (the `UseItem` aim — valid even off any world cell).
     /// `cursor_on_npc` suppresses the whole RMB half: a right-click there
     /// talks to the hovered NPC (`app.rs` sends `TalkNpc`, §7.4) and must
     /// not also toggle the door or place a tile behind the NPC.
@@ -82,42 +115,83 @@ impl Interact {
         slots: &[Option<InvSlot>],
         selected: u8,
         aim: Option<(u32, u32)>,
+        aim_pos: (f32, f32),
         cursor_on_npc: bool,
+        now: f64,
         dt: f32,
     ) {
         self.swing_cd = (self.swing_cd - dt).max(0.0);
         self.place_cd = (self.place_cd - dt).max(0.0);
+        let held = slots
+            .get(selected as usize)
+            .copied()
+            .flatten()
+            .map(|s| s.item);
+        let data = held.map(|i| i.data());
+        let tool = data.and_then(|d| d.tool);
+        // Swingable weapon rows only — `Arrow` rows are ammo (§4.1).
+        let weapon = data
+            .and_then(|d| d.weapon)
+            .filter(|w| matches!(w.kind, WeaponKind::Melee | WeaponKind::Bow));
+
+        // LMB resolution mirrors the server, where `HitTile`/`HitWall` mine
+        // and `UseItem` runs the weapon row, all behind one §4.1 rate
+        // limit: items with both rows (pickaxes also deal melee damage)
+        // prefer the tool when aiming at a minable cell in reach;
+        // weapon-only items never send `HitTile`. The weapon path has no
+        // aim/reach gate — `use_item` enforces none (the melee arc anchors
+        // on the player, bows fire toward any aim), so air and far enemies
+        // are fine. Consumables (§8 healing potions, Life Crystals, boss
+        // summons) have neither row and fall through to a bare `UseItem`.
+        if is_mouse_button_down(MouseButton::Left) && self.swing_cd <= 0.0 {
+            let weapon_only = weapon.is_some() && tool.is_none();
+            let tool_msg = aim
+                .filter(|&(x, y)| !weapon_only && tile_in_reach(center, x, y))
+                .and_then(|(x, y)| {
+                    let t = world.tile(x, y);
+                    let hammer = tool.is_some_and(|t| t.kind == ToolKind::Hammer);
+                    if t.id != TileId::Air {
+                        Some(ClientMessage::HitTile { x, y })
+                    } else if hammer && t.wall != WallId::Air {
+                        Some(ClientMessage::HitWall { x, y })
+                    } else {
+                        None
+                    }
+                });
+            if let Some(msg) = tool_msg {
+                ws.send(&msg);
+                self.start_use(held, now, false);
+            } else if let Some(w) = weapon {
+                // Mirror the server's ammo lookup: a bow with no arrows in
+                // the carry slots fires nothing — don't animate a phantom.
+                let is_bow = w.kind == WeaponKind::Bow;
+                if !is_bow || has_arrows(slots) {
+                    ws.send(&ClientMessage::UseItem {
+                        slot: selected,
+                        aim: aim_pos,
+                    });
+                    self.start_use(held, now, is_bow);
+                }
+            } else if data.is_some_and(|d| d.consumable.is_some()) {
+                // The server validates the actual effect (Potion Sickness,
+                // already-full HP, the §8 Life Crystal cap) — we just send
+                // the intent and pace re-sends at the §4.1 use cadence.
+                ws.send(&ClientMessage::UseItem {
+                    slot: selected,
+                    aim: aim_pos,
+                });
+                self.start_use(held, now, false);
+            }
+        }
+
+        // Everything below needs an in-reach world cell under the mouse.
         let Some((x, y)) = aim else {
             return;
         };
         if !tile_in_reach(center, x, y) {
             return; // red highlight already says why
         }
-        let held = slots
-            .get(selected as usize)
-            .copied()
-            .flatten()
-            .map(|s| s.item);
         let t = world.tile(x, y);
-
-        // LMB: swing at the aimed cell — the foreground tile, or the wall
-        // behind it when holding a hammer.
-        if is_mouse_button_down(MouseButton::Left) && self.swing_cd <= 0.0 {
-            let hammer = held
-                .and_then(|i| i.data().tool)
-                .is_some_and(|t| t.kind == ToolKind::Hammer);
-            let msg = if t.id != TileId::Air {
-                Some(ClientMessage::HitTile { x, y })
-            } else if hammer && t.wall != WallId::Air {
-                Some(ClientMessage::HitWall { x, y })
-            } else {
-                None
-            };
-            if let Some(msg) = msg {
-                ws.send(&msg);
-                self.swing_cd = use_secs(held);
-            }
-        }
 
         // The RMB half belongs to the hovered NPC (doc comment above).
         if cursor_on_npc {
@@ -299,4 +373,19 @@ fn use_secs(held: Option<ItemId>) -> f32 {
     })
     .unwrap_or(BARE_HAND_USE_SECS)
     .max(1.0 / 60.0)
+}
+
+/// Any arrow stack in the carry slots (hotbar + backpack) — the same
+/// lookup the server's `fire_bow` makes before consuming ammo.
+fn has_arrows(slots: &[Option<InvSlot>]) -> bool {
+    slots
+        .iter()
+        .take(inventory::ARMOR_START)
+        .flatten()
+        .any(|s| {
+            s.item
+                .data()
+                .weapon
+                .is_some_and(|w| w.kind == WeaponKind::Arrow)
+        })
 }

@@ -43,6 +43,12 @@ pub mod anim {
     pub const GROUNDED: u8 = 1 << 1;
     /// Submerged / swim animation.
     pub const IN_LIQUID: u8 = 1 << 2;
+    /// A Gust Jar mid-air jump happened since the previous `PlayerState`.
+    /// Movement is client-authoritative, so the server can't see the jump
+    /// itself; this flag lets it reset its observed fall distance (§8: a
+    /// mid-air jump negates fall damage). The server only honors it when a
+    /// Gust Jar is actually equipped.
+    pub const AIR_JUMPED: u8 = 1 << 3;
 }
 
 /// Why an entity left the world ([`ServerMessage::EntityDespawn`]).
@@ -452,6 +458,22 @@ pub enum ServerMessage {
         idx: u8,
         stack: Option<InvSlot>,
     },
+    /// Knockback applied to the receiving player (enemy contact / projectile
+    /// hit, §5). Own movement is client-authoritative, so the server can't
+    /// move the player itself — the client adds this to its predicted
+    /// velocity.
+    PlayerKnockback {
+        vx: f32,
+        vy: f32,
+    },
+    /// An entity took damage (combat feedback: hit flash, floating damage
+    /// number — crits render larger/yellow). HP itself syncs through
+    /// [`ServerMessage::EntityUpdate`].
+    EntityHurt {
+        id: u32,
+        damage: u32,
+        crit: bool,
+    },
 }
 
 /// Encodes a message into a postcard frame. Infallible for these types
@@ -690,6 +712,12 @@ mod tests {
         roundtrip_server(ServerMessage::ChestSlotChanged {
             idx: 0,
             stack: None,
+        });
+        roundtrip_server(ServerMessage::PlayerKnockback { vx: -5.0, vy: -2.5 });
+        roundtrip_server(ServerMessage::EntityHurt {
+            id: 9,
+            damage: 14,
+            crit: true,
         });
     }
 

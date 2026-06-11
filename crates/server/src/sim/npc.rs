@@ -36,7 +36,7 @@ use ferraria_shared::tiles::TileId;
 use ferraria_shared::world::{World, DAWN_TICK};
 use ferraria_shared::{damage_dealt, DT};
 
-use super::entities::{Entity, EntityKind};
+use super::entities::{AiState, Entity, EntityKind};
 use super::game::Sim;
 use super::housing::{check_house, find_vacant_house};
 
@@ -52,54 +52,6 @@ const WANDER_WALK_TICKS: (u32, u32) = (120, 420);
 const WANDER_PAUSE_TICKS: (u32, u32) = (60, 240);
 /// Turn around rather than walk off a drop deeper than this many tiles.
 const LEDGE_MAX_DROP: u32 = 3;
-
-// ---- Debuff storage seam ------------------------------------------------------
-
-/// Per-player debuff storage.
-///
-/// INTEGRATE(nurse-debuffs): the enemies/combat branch owns debuff
-/// *application and ticking* (Burning damage, Darkness, Potion Sickness on
-/// potion use). This branch only needs storage the Nurse can count and
-/// clear (§7.4) and dialogue can read; nothing on this branch inserts
-/// debuffs. The merge train should keep exactly one storage — this one or
-/// the sibling's — and point both features at it.
-#[derive(Debug, Default, Clone)]
-pub struct DebuffSet {
-    active: Vec<ActiveDebuff>,
-}
-
-impl DebuffSet {
-    pub fn has(&self, debuff: Debuff) -> bool {
-        self.active.iter().any(|d| d.debuff == debuff)
-    }
-
-    /// How many active debuffs a Nurse heal would clear (everything except
-    /// Potion Sickness, §7.4).
-    pub fn nurse_clearable(&self) -> u32 {
-        self.active
-            .iter()
-            .filter(|d| d.debuff != Debuff::PotionSickness)
-            .count() as u32
-    }
-
-    /// §7.4: clears everything except Potion Sickness.
-    pub fn clear_except_potion_sickness(&mut self) {
-        self.active.retain(|d| d.debuff == Debuff::PotionSickness);
-    }
-
-    /// Wire form for `ServerMessage::PlayerDebuffs`.
-    pub fn as_wire(&self) -> Vec<ActiveDebuff> {
-        self.active.clone()
-    }
-
-    #[cfg(test)]
-    pub fn insert_for_test(&mut self, debuff: Debuff, remaining_ticks: u32) {
-        self.active.push(ActiveDebuff {
-            debuff,
-            remaining_ticks,
-        });
-    }
-}
 
 // ---- NPC state ----------------------------------------------------------------
 
@@ -123,7 +75,9 @@ pub(crate) struct Npc {
 }
 
 impl Npc {
-    fn center(&self) -> (f32, f32) {
+    /// AABB center (shared with `Sim::town_npc_positions` for the §5.3
+    /// step 3 spawn suppression).
+    pub(crate) fn center(&self) -> (f32, f32) {
         self.phys.center()
     }
 }
@@ -159,6 +113,9 @@ impl Sim {
             spawn_tick: self.tick,
             awake: true,
             state: npc_anim::FACING_RIGHT,
+            hp: 0, // NPC HP lives in `Sim::town`, not the store
+            hp_dirty: false,
+            ai: AiState::default(),
         });
         self.town.npcs.insert(
             id,
@@ -401,23 +358,6 @@ impl Sim {
         NPC_FIGHT_BACK_DAMAGE
     }
 
-    /// Live town-NPC tile positions.
-    ///
-    /// INTEGRATE(town-suppression): the enemy spawner (§5.3 step 3) consumes
-    /// this — each town NPC within 50 tiles of the spawn target scales the
-    /// spawn denominator and cap; nothing on this branch calls it.
-    #[allow(dead_code)]
-    pub fn town_npc_positions(&self) -> Vec<(u32, u32)> {
-        self.town
-            .npcs
-            .values()
-            .map(|n| {
-                let c = n.center();
-                (c.0.max(0.0) as u32, c.1.max(0.0) as u32)
-            })
-            .collect()
-    }
-
     // ---- Roster sync -----------------------------------------------------------------
 
     /// Full NPC roster, broadcast on any roster/housing change and sent to
@@ -486,10 +426,10 @@ impl Sim {
             watcher_defeated: flags.watcher_defeated,
             slime_monarch_defeated: flags.slime_monarch_defeated,
             bone_warden_defeated: flags.bone_warden_defeated,
-            low_hp: p.hp * 100 < p.max_hp * LOW_HP_PERCENT,
+            low_hp: (p.hp as u32) * 100 < (p.max_hp as u32) * LOW_HP_PERCENT,
             full_hp: p.hp >= p.max_hp,
             rich: coin_total(&p.inventory) > RICH_PLAYER_COPPER,
-            potion_sick: p.debuffs.has(Debuff::PotionSickness),
+            potion_sick: p.debuffs.iter().any(|&(d, _)| d == Debuff::PotionSickness),
             homeless: npc.home.is_none(),
         };
         Some((npc.kind, ctx))
@@ -605,9 +545,14 @@ impl Sim {
             );
             return;
         }
-        let cleared = p.debuffs.nurse_clearable();
+        // §7.4: a heal clears everything except Potion Sickness.
+        let cleared = p
+            .debuffs
+            .iter()
+            .filter(|&&(d, _)| d != Debuff::PotionSickness)
+            .count() as u32;
         let cost = nurse_heal_cost(
-            hp_restored,
+            hp_restored as u32,
             cleared,
             flags.watcher_defeated,
             flags.bone_warden_defeated,
@@ -623,15 +568,22 @@ impl Sim {
             return;
         };
         p.hp = p.max_hp;
-        p.debuffs.clear_except_potion_sickness();
+        p.debuffs.retain(|&(d, _)| d == Debuff::PotionSickness);
         let health = ServerMessage::PlayerHealth {
             id: player_id,
-            hp: p.hp as u16,
-            max_hp: p.max_hp as u16,
+            hp: p.hp,
+            max_hp: p.max_hp,
         };
         let debuffs = ServerMessage::PlayerDebuffs {
             id: player_id,
-            debuffs: p.debuffs.as_wire(),
+            debuffs: p
+                .debuffs
+                .iter()
+                .map(|&(debuff, remaining_ticks)| ActiveDebuff {
+                    debuff,
+                    remaining_ticks,
+                })
+                .collect(),
         };
         self.send_inventory_changes(player_id, changed);
         for s in spill {
@@ -641,35 +593,13 @@ impl Sim {
         self.broadcast(&debuffs);
     }
 
-    /// `SetBedSpawn` (§8): right-clicking a bed within reach stores the
-    /// per-player spawn at the bed's origin.
-    pub(crate) fn set_bed_spawn(&mut self, player_id: u32, x: u32, y: u32) {
-        if !self.world.in_bounds(x, y) || self.world.tile(x, y).id != TileId::Bed {
-            return;
-        }
-        let origin = self.world.multitile_origin(x, y);
-        let Some(p) = self.players.get_mut(&player_id) else {
-            return;
-        };
-        if !bed_in_reach(p.center(), origin) {
-            return;
-        }
-        p.bed_spawn = Some(origin);
-        self.send_to(
-            player_id,
-            &ServerMessage::Toast {
-                text: "Spawn point set!".into(),
-            },
-        );
-    }
-
     /// Where `player_id` respawns (§8): standing on their bed if the bed
     /// still exists (checked now, at respawn time), else the world spawn.
     /// Returns the AABB top-left like all player positions.
     ///
-    /// INTEGRATE(bed-respawn): the respawn flow (enemies/combat branch —
-    /// death, timers, `ClientMessage::Respawn`) places the player with
-    /// this; nothing on this branch dies.
+    /// The live §8 respawn flow (`sim::survival::respawn_player`) derives
+    /// the same placement from `bed_spawn_pos`; this helper remains for the
+    /// bed-spawn unit tests.
     #[allow(dead_code)]
     pub(crate) fn spawn_point_for(&self, player_id: u32) -> (f32, f32) {
         let world_spawn = PlayerPhysics::from_feet(
@@ -762,19 +692,6 @@ fn in_talk_range(player_center: (f32, f32), npc_center: (f32, f32)) -> bool {
         player_center.1 - npc_center.1,
     );
     dx * dx + dy * dy <= NPC_TALK_RANGE * NPC_TALK_RANGE
-}
-
-/// Bed reach: any cell of the 4×2 footprint within §8 reach of the player.
-fn bed_in_reach(center: (f32, f32), origin: (u32, u32)) -> bool {
-    let (w, h) = TileId::Bed.data().size;
-    for dy in 0..h as u32 {
-        for dx in 0..w as u32 {
-            if ferraria_shared::tile_in_reach(center, origin.0 + dx, origin.1 + dy) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// One tick of a single NPC: shelter (stand at home) at night/boss, §7.1
@@ -1238,7 +1155,7 @@ mod tests {
             p.hp = 20; // 20% of 100
             p.inventory[9] = Some(InvSlot::new(ItemId::GoldCoin, 2));
             p.debuffs
-                .insert_for_test(Debuff::PotionSickness, 60 * ferraria_shared::TICK_RATE);
+                .push((Debuff::PotionSickness, 60 * ferraria_shared::TICK_RATE));
         }
         sim.world.time = 0; // midnight
         sim.world.flags.watcher_defeated = true;
@@ -1508,8 +1425,8 @@ mod tests {
         {
             let p = sim.players.get_mut(&a).expect("p");
             p.hp = 50; // restore 150
-            p.debuffs.insert_for_test(Debuff::Burning, 100);
-            p.debuffs.insert_for_test(Debuff::PotionSickness, 100);
+            p.debuffs.push((Debuff::Burning, 100));
+            p.debuffs.push((Debuff::PotionSickness, 100));
         }
         let start = coins_of(&sim, a);
         msg(&mut sim, a, ea, ClientMessage::NurseHeal);
@@ -1517,9 +1434,12 @@ mod tests {
         assert_eq!(p.hp, 200, "healed to full");
         // 150 CC + 1 SC (one clearable debuff — potion sickness exempt).
         assert_eq!(coins_of(&sim, a), start - 250);
-        assert!(!p.debuffs.has(Debuff::Burning), "burning cleared");
         assert!(
-            p.debuffs.has(Debuff::PotionSickness),
+            !p.debuffs.iter().any(|&(d, _)| d == Debuff::Burning),
+            "burning cleared"
+        );
+        assert!(
+            p.debuffs.iter().any(|&(d, _)| d == Debuff::PotionSickness),
             "potion sickness stays"
         );
 
@@ -1659,11 +1579,11 @@ mod tests {
     }
 
     #[test]
-    fn town_npc_positions_reports_live_tiles() {
+    fn town_npc_positions_reports_live_centers() {
         let sim = flat_sim(300, 60, FLOOR);
         let positions = sim.town_npc_positions();
-        assert_eq!(positions.len(), 1);
-        assert!((positions[0].0 as i64 - 150).abs() <= 1);
+        assert_eq!(positions.len(), 1, "the boot Sage");
+        assert!((positions[0].0 - 150.0).abs() <= 1.6);
     }
 
     #[test]
@@ -1721,6 +1641,29 @@ mod tests {
         let p = &sim.players[&a];
         assert_eq!((p.hp, p.max_hp), (77, 140));
         assert_eq!(p.bed_spawn, Some((152, FLOOR - 2)));
+    }
+
+    #[test]
+    fn town_npcs_suppress_hostile_spawns() {
+        let mut sim = flat_sim(300, 60, FLOOR);
+        let (a, _ea, _rx) = join(&mut sim, "alice");
+        place_player(&mut sim, a, 150.0, FLOOR as f32);
+        sim.world.time = 0; // night: SurfaceNight spawning is live
+                            // Three town NPCs within 50 tiles → §5.3 step 3: no hostile spawns.
+        for i in 0..3 {
+            sim.spawn_town_npc(NpcKind::Sage, (148.0 + i as f32 * 2.0, FLOOR as f32), None);
+        }
+        // One night-tick worth of evaluations; without suppression the
+        // 1/300-per-tick SurfaceNight roll would all but surely fire
+        // (P(no spawn in 3600 tries) ≈ e⁻¹²).
+        for _ in 0..3600 {
+            sim.tick_enemy_spawning();
+        }
+        assert_eq!(
+            sim.live_enemies(),
+            0,
+            "3 town NPCs in 50 tiles must fully suppress hostile spawns"
+        );
     }
 
     #[test]

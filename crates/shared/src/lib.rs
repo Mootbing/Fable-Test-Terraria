@@ -9,6 +9,7 @@
 
 pub mod coins;
 pub mod crafting;
+pub mod enemies;
 pub mod inventory_ops;
 pub mod items;
 pub mod loadout;
@@ -172,8 +173,8 @@ pub const COPPER_PER_GOLD: u32 = 10_000;
 pub const COPPER_PER_PLATINUM: u32 = 1_000_000;
 
 /// The one damage formula (§0): `max(1, attack − floor(defense / 2))`.
-/// Crit doubling and accessory/set multipliers apply to `attack` before
-/// calling this.
+/// Accessory/set multipliers apply to `attack` before calling this; the
+/// §0 crit then doubles the *dealt* damage this returns ("×2 damage").
 pub fn damage_dealt(attack: u32, defense: u32) -> u32 {
     (attack as i64 - defense as i64 / 2).max(1) as u32
 }
