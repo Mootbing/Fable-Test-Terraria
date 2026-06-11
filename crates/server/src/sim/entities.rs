@@ -44,7 +44,9 @@ pub enum EntityKind {
     /// shared pos/vel for snapshot batching and chunk visibility. NPCs
     /// announce themselves via `ServerMessage::NpcList` (roster broadcast
     /// to everyone), not per-chunk spawn messages.
-    Npc { kind: NpcKind },
+    Npc {
+        kind: NpcKind,
+    },
 }
 
 /// One live entity. Positions are the AABB top-left in tile units, matching
@@ -434,13 +436,18 @@ impl Sim {
     }
 
     /// Snapshot batch (every 3 ticks): awake entities only, filtered per
-    /// player to their chunk window.
+    /// player to their chunk window. NPCs are exempt from the awake gate:
+    /// a night-sheltered NPC moves nothing for minutes, but players whose
+    /// chunk window re-gains the town (NPCs get no `spawn_message` re-sync)
+    /// must still receive its authoritative position, or talk/heal/shop
+    /// intents aimed at the stale ghost silently fail the server's range
+    /// check. Three NPCs at 20/s is negligible wire cost.
     pub(crate) fn broadcast_entity_updates(&mut self) {
         let states: Vec<((u32, u32), EntityState)> = self
             .entities
             .map
             .iter()
-            .filter(|(_, e)| e.awake)
+            .filter(|(_, e)| e.awake || matches!(e.kind, EntityKind::Npc { .. }))
             .map(|(&id, e)| {
                 (
                     e.chunk(),

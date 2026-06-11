@@ -22,6 +22,18 @@ pub const NPC_FIGHT_BACK_DAMAGE: u32 = 10;
 /// Day wander leash: within 25 tiles of home (§7.1).
 pub const NPC_WANDER_RADIUS: f32 = 25.0;
 
+/// Talk/shop/heal interaction range, player center to NPC center: §8 reach
+/// (6 tiles) plus a body-width of slack so standing flush always works.
+/// Shared because the client's "[E] talk" prompt and panel auto-close must
+/// agree with the server's validation.
+pub const NPC_TALK_RANGE: f32 = crate::REACH + 1.0;
+
+/// Animation bits carried in NPC `EntityState::state` snapshots.
+pub mod anim {
+    pub const FACING_RIGHT: u8 = 1 << 0;
+    pub const WALKING: u8 = 1 << 1;
+}
+
 // ---- Arrival (§7.2) ----------------------------------------------------------
 
 /// Merchant: all players' combined inventory coins ≥ 50 SC (§7.2).
@@ -35,11 +47,11 @@ pub const NURSE_ARRIVAL_MAX_HP: u32 = 100;
 pub enum ArrivalCondition {
     /// Sage: at world spawn from the start.
     WorldStart,
-    /// Merchant: combined online-player coins ≥ this many copper, plus a
-    /// vacant valid house.
+    /// Merchant: all players' (online and offline) combined coins ≥ this
+    /// many copper, plus a vacant valid house.
     CombinedCoinsAtLeast(u64),
-    /// Nurse: any player's max HP strictly over this, the Merchant present,
-    /// plus a vacant valid house.
+    /// Nurse: any player's (online or offline) max HP strictly over this,
+    /// the Merchant present, plus a vacant valid house.
     MaxHpOverAndMerchantPresent(u32),
 }
 
@@ -359,10 +371,15 @@ pub fn shop_price(item: ItemId) -> Option<u32> {
 }
 
 /// The merchant buys anything back at 20% of base value (§7.3), rounded
-/// down. 0 means unsellable (items with no value).
+/// down. 0 means unsellable: items with no value, and coins — "buys back
+/// any item" doesn't extend to currency, whose value *is* its face value
+/// (selling money at 20% would just destroy 80% of it).
 pub const SELL_PRICE_PERCENT: u32 = 20;
 
 pub fn sell_price(item: ItemId) -> u32 {
+    if crate::coins::is_coin(item) {
+        return 0;
+    }
     item.data().value * SELL_PRICE_PERCENT / 100
 }
 
@@ -440,6 +457,16 @@ mod tests {
         // Rounding down: value 9 would be 1 (9*20/100 = 1.8 → 1); the
         // smallest valued items demonstrate the floor.
         assert_eq!(sell_price(ItemId::Platform), 0); // 4 × 0.2 = 0.8 → 0
+    }
+
+    #[test]
+    fn coins_are_unsellable() {
+        // A coin's `value` is its denomination, so without the exemption
+        // the routine shift-click gesture would sell money at 20% of face
+        // value and irreversibly destroy the rest.
+        for (coin, _) in crate::coins::COIN_DENOMS {
+            assert_eq!(sell_price(coin), 0, "{coin:?}");
+        }
     }
 
     #[test]

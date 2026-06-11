@@ -496,6 +496,191 @@ async fn chest_lock_and_crafting_over_websocket() {
     assert_eq!(slots[0], None, "alice took the wood");
 }
 
+/// Town NPCs end to end (DESIGN §7): the boot-time Sage answers `TalkNpc`
+/// with a §7.5 line; stocking up 50 SC from a chest trips the hourly
+/// Merchant arrival check (a valid house is pre-built), and `BuyItem`
+/// round-trips a purchase with coin change.
+#[tokio::test]
+async fn talk_to_sage_and_buy_from_merchant_over_websocket() {
+    use ferraria_server::sim::npc::IN_GAME_HOUR_TICKS;
+    use ferraria_shared::npc::{npc_data, MERCHANT_SHOP};
+    use ferraria_shared::physics::PLAYER_HEIGHT;
+    use ferraria_shared::protocol::NpcKind;
+    use ferraria_shared::tiles::{state, Tile, WallId};
+
+    let mut chest_pos = (0u32, 0u32);
+    let mut house_x0 = 0u32;
+    let mut floor_y = 0u32;
+    let port = start_server_with(|world| {
+        let (sx, sy) = world.spawn;
+        // ---- A §7.1-valid house: 10×4 interior, stone shell, wood walls,
+        // door, torch, table, chair — stamped over whatever terrain is
+        // there, 8 tiles right of spawn.
+        house_x0 = sx + 8;
+        floor_y = sy + 1; // the worldgen spawn platform row
+        let (x0, ih) = (house_x0, 4u32);
+        let y_top = floor_y - ih;
+        for x in x0 - 1..=x0 + 10 {
+            for y in y_top - 1..=floor_y {
+                let interior = (x0..x0 + 10).contains(&x) && (y_top..floor_y).contains(&y);
+                let mut t = Tile::AIR;
+                if interior {
+                    t.wall = WallId::Wood;
+                } else {
+                    t.id = TileId::Stone;
+                }
+                world.set_tile(x, y, t);
+            }
+        }
+        for d in 0..3u32 {
+            let mut t = world.tile(x0 - 1, floor_y - 1 - d);
+            t.id = TileId::Door;
+            t.state = state::part(0, (2 - d) as u8);
+            world.set_tile(x0 - 1, floor_y - 1 - d, t);
+        }
+        let mut torch = world.tile(x0, floor_y - 1);
+        torch.id = TileId::Torch;
+        world.set_tile(x0, floor_y - 1, torch);
+        assert!(world.place_multitile(x0 + 1, floor_y - 2, TileId::Table));
+        assert!(world.place_multitile(x0 + 4, floor_y - 2, TileId::Chair));
+
+        // ---- A chest by the spawn holding the 50 SC arrival threshold.
+        let mut placed = None;
+        'search: for dx in 2..5u32 {
+            for dy in 1..4u32 {
+                let (x, y) = (sx - dx, sy.saturating_sub(dy));
+                if world.place_multitile(x, y, TileId::Chest) {
+                    placed = Some((x, y));
+                    break 'search;
+                }
+            }
+        }
+        let (cx, cy) = placed.expect("a chest spot near spawn");
+        let mut slots = vec![None; CHEST_SLOTS];
+        slots[0] = Some(InvSlot::new(ItemId::SilverCoin, 50));
+        world.chests.insert((cx, cy), slots);
+        chest_pos = (cx, cy);
+
+        // ---- Park the clock 5 real seconds before an in-game-hour
+        // boundary, so the §7.2 arrival check fires shortly after boot.
+        world.time = (world.time / IN_GAME_HOUR_TICKS + 1) * IN_GAME_HOUR_TICKS - 300;
+    })
+    .await;
+
+    let mut ws = connect(port).await;
+    let _ = join(&mut ws, "trader").await;
+
+    // ---- The boot-time Sage is in the join-state roster. -----------------
+    let sage = expect(&mut ws, "NpcList with the Sage", |m| match m {
+        ServerMessage::NpcList { npcs } => npcs
+            .iter()
+            .find(|n| n.kind == NpcKind::Sage)
+            .map(|n| (n.id, n.name.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(sage.1, "Sage the Guide");
+
+    // ---- Talk to the Sage: a §7.5 line comes back. -------------------------
+    send(&mut ws, &ClientMessage::TalkNpc { npc_id: sage.0 }).await;
+    let line = expect(&mut ws, "NpcDialogue", |m| match m {
+        ServerMessage::NpcDialogue { npc_id, line } if npc_id == sage.0 => Some(line),
+        _ => None,
+    })
+    .await;
+    assert!(
+        npc_data(NpcKind::Sage).lines.iter().any(|l| l.text == line),
+        "a verbatim §7.5 Sage line, got {line:?}"
+    );
+
+    // ---- Withdraw the 50 SC from the chest. ---------------------------------
+    let (cx, cy) = chest_pos;
+    send(&mut ws, &ClientMessage::OpenChest { x: cx, y: cy }).await;
+    expect(&mut ws, "ChestContents", |m| match m {
+        ServerMessage::ChestContents { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    send(
+        &mut ws,
+        &ClientMessage::ChestMoveSlot {
+            chest_slot: 0,
+            inv_slot: 9,
+            to_chest: false,
+        },
+    )
+    .await;
+    expect(&mut ws, "coins in slot 9", |m| match m {
+        ServerMessage::SlotChanged { idx: 9, stack } => {
+            assert_eq!(stack, Some(InvSlot::new(ItemId::SilverCoin, 50)));
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    // ---- The hourly arrival check trips: toast + roster update. -------------
+    expect(&mut ws, "merchant arrival toast", |m| match m {
+        ServerMessage::Toast { text } if text == "The Merchant has arrived!" => Some(()),
+        _ => None,
+    })
+    .await;
+    let merchant = expect(&mut ws, "NpcList with the Merchant", |m| match m {
+        ServerMessage::NpcList { npcs } => npcs
+            .iter()
+            .find(|n| n.kind == NpcKind::Merchant && n.housed)
+            .map(|n| n.id),
+        _ => None,
+    })
+    .await;
+
+    // ---- Walk into the house, talk (catalog comes along), and buy. -----------
+    let home_x = house_x0 as f32 + 6.0;
+    send(
+        &mut ws,
+        &ClientMessage::PlayerState {
+            pos: (home_x, floor_y as f32 - PLAYER_HEIGHT - 0.01),
+            vel: (0.0, 0.0),
+            facing: 1,
+            anim: 0,
+        },
+    )
+    .await;
+    send(&mut ws, &ClientMessage::TalkNpc { npc_id: merchant }).await;
+    let catalog = expect(&mut ws, "ShopContents", |m| match m {
+        ServerMessage::ShopContents { npc_id, items } if npc_id == merchant => Some(items),
+        _ => None,
+    })
+    .await;
+    assert_eq!(catalog.len(), MERCHANT_SHOP.len());
+
+    send(
+        &mut ws,
+        &ClientMessage::BuyItem {
+            npc_id: merchant,
+            item: ItemId::Bottle,
+            count: 1,
+        },
+    )
+    .await;
+    // The purchase lands in the inventory and the coins make change
+    // (50 SC − 20 CC → a broken silver).
+    let (mut got_bottle, mut got_change) = (false, false);
+    while !(got_bottle && got_change) {
+        match recv(&mut ws).await {
+            ServerMessage::SlotChanged { stack: Some(s), .. } if s.item == ItemId::Bottle => {
+                assert_eq!(s.count, 1);
+                got_bottle = true;
+            }
+            ServerMessage::SlotChanged { stack: Some(s), .. } if s.item == ItemId::CopperCoin => {
+                assert_eq!(s.count, 80, "change from the broken silver");
+                got_change = true;
+            }
+            _ => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn wrong_protocol_version_is_rejected() {
     let port = start_server().await;

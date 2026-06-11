@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
+use ferraria_shared::coins::coin_total;
 use ferraria_shared::inventory_ops::SlotOp;
 use ferraria_shared::items::{inventory, InvSlot, ItemId, STARTING_KIT};
 use ferraria_shared::physics::{PlayerPhysics, PLAYER_HEIGHT, PLAYER_WIDTH};
@@ -576,6 +577,31 @@ impl Sim {
         self.player_count
             .store(self.players.len(), Ordering::Relaxed);
         self.broadcast(&ServerMessage::PlayerLeft { id });
+    }
+
+    /// §7.2 "All players' combined inventory coins": online sessions plus
+    /// the parked offline records. Nothing is counted twice — a reclaim
+    /// removes the offline record before the session goes online, and
+    /// `join` rejects a name that is already online.
+    pub(crate) fn combined_player_coins(&self) -> u64 {
+        let online: u64 = self
+            .players
+            .values()
+            .map(|p| coin_total(&p.inventory))
+            .sum();
+        let offline: u64 = self
+            .offline
+            .values()
+            .map(|rec| coin_total(&rec.inventory))
+            .sum();
+        online + offline
+    }
+
+    /// §7.2 "Any player has max HP > `hp`", online or parked offline (same
+    /// no-double-count argument as [`Sim::combined_player_coins`]).
+    pub(crate) fn any_player_max_hp_over(&self, hp: u32) -> bool {
+        self.players.values().any(|p| p.max_hp > hp)
+            || self.offline.values().any(|rec| rec.max_hp > hp)
     }
 
     fn flush_kicks(&mut self) {

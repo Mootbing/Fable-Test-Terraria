@@ -20,9 +20,10 @@ use std::collections::BTreeMap;
 use ferraria_shared::coins::{add_coins, coin_total, remove_coins};
 use ferraria_shared::items::{add_to_inventory, inventory, InvSlot, ItemId};
 use ferraria_shared::npc::{
-    npc_data, nurse_heal_cost, pick_line, sell_price, shop_price, ArrivalCondition, DialogueCtx,
-    LOW_HP_PERCENT, MERCHANT_SHOP, NPC_DEFENSE, NPC_FIGHT_BACK_DAMAGE, NPC_HP, NPC_KINDS,
-    NPC_WANDER_RADIUS, RICH_PLAYER_COPPER,
+    anim as npc_anim, npc_data, nurse_heal_cost, pick_line, sell_price, shop_price,
+    ArrivalCondition, DialogueCtx, LOW_HP_PERCENT, MERCHANT_SHOP, NPC_DEFENSE,
+    NPC_FIGHT_BACK_DAMAGE, NPC_HP, NPC_KINDS, NPC_TALK_RANGE, NPC_WANDER_RADIUS,
+    RICH_PLAYER_COPPER,
 };
 use ferraria_shared::physics::{
     step_player_with_mods, PhysicsMods, PlayerInput, PlayerPhysics, PLAYER_HEIGHT, PLAYER_WIDTH,
@@ -33,7 +34,7 @@ use ferraria_shared::protocol::{
 use ferraria_shared::rng::Pcg32;
 use ferraria_shared::tiles::TileId;
 use ferraria_shared::world::{World, DAWN_TICK};
-use ferraria_shared::{damage_dealt, DT, REACH};
+use ferraria_shared::{damage_dealt, DT};
 
 use super::entities::{Entity, EntityKind};
 use super::game::Sim;
@@ -43,10 +44,6 @@ use super::housing::{check_house, find_vacant_house};
 /// "checked on demand"; 1 in-game hour = 3600 ticks = 60 real seconds).
 pub const IN_GAME_HOUR_TICKS: u32 = 3600;
 
-/// Talk/shop/heal interaction range, player center to NPC center. §8 reach
-/// (6 tiles) plus a body-width of slack so standing flush always works.
-pub const NPC_TALK_RANGE: f32 = REACH + 1.0;
-
 /// NPC walk speed as a fraction of the player run max (≈2 t/s) — town folk
 /// stroll. DESIGN gives no number; canonized here.
 const NPC_WALK_SPEED_MULT: f32 = 0.18;
@@ -55,12 +52,6 @@ const WANDER_WALK_TICKS: (u32, u32) = (120, 420);
 const WANDER_PAUSE_TICKS: (u32, u32) = (60, 240);
 /// Turn around rather than walk off a drop deeper than this many tiles.
 const LEDGE_MAX_DROP: u32 = 3;
-
-/// Entity-state animation bits for NPC snapshots (client renders these).
-pub mod npc_anim {
-    pub const FACING_RIGHT: u8 = 1 << 0;
-    pub const WALKING: u8 = 1 << 1;
-}
 
 // ---- Debuff storage seam ------------------------------------------------------
 
@@ -188,7 +179,7 @@ impl Sim {
     pub(crate) fn tick_npcs(&mut self) {
         if self.world.time == DAWN_TICK {
             self.npc_dawn();
-        } else if self.world.time % IN_GAME_HOUR_TICKS == 0 {
+        } else if self.world.time.is_multiple_of(IN_GAME_HOUR_TICKS) {
             self.npc_arrival_checks();
         }
         self.step_town_npcs();
@@ -199,19 +190,28 @@ impl Sim {
     fn npc_dawn(&mut self) {
         let mut changed = false;
 
-        // Revalidate every assigned home (§7.1 "checked every dawn").
+        // Revalidate every assigned home (§7.1 "checked every dawn"):
+        // rules 1–6 via `check_house`, then rule 7 — players can merge two
+        // occupied rooms into one, and the merged room keeps only its first
+        // NPC (id order); the rest are evicted to re-claim below.
         let assignments: Vec<(u32, (u32, u32))> = self
             .town
             .npcs
             .iter()
             .filter_map(|(&id, n)| n.home.map(|h| (id, h)))
             .collect();
+        let mut kept_homes: Vec<(u32, u32)> = Vec::new();
         for (id, home) in assignments {
-            if check_house(&self.world, home).is_err() {
-                if let Some(n) = self.town.npcs.get_mut(&id) {
-                    n.home = None;
-                    changed = true;
-                }
+            let valid = match check_house(&self.world, home) {
+                // Rule 7: an already-kept NPC's home tile inside this room.
+                Ok(house) => !kept_homes.iter().any(|&h| house.contains(h)),
+                Err(_) => false,
+            };
+            if valid {
+                kept_homes.push(home);
+            } else if let Some(n) = self.town.npcs.get_mut(&id) {
+                n.home = None;
+                changed = true;
             }
         }
 
@@ -273,18 +273,15 @@ impl Sim {
             }
             let condition_met = match npc_data(kind).arrival {
                 ArrivalCondition::WorldStart => false, // boot-time only
-                // Combined coins across all *online* players' inventories.
+                // §7.2 "All players": online sessions plus the parked
+                // offline players' inventories, summed without double
+                // counting (`Sim::combined_player_coins`).
                 ArrivalCondition::CombinedCoinsAtLeast(copper) => {
-                    let total: u64 = self
-                        .players
-                        .values()
-                        .map(|p| coin_total(&p.inventory))
-                        .sum();
-                    total >= copper
+                    self.combined_player_coins() >= copper
                 }
+                // §7.2 "Any player": offline players' max HP counts too.
                 ArrivalCondition::MaxHpOverAndMerchantPresent(hp) => {
-                    self.players.values().any(|p| p.max_hp > hp)
-                        && self.npc_alive(NpcKind::Merchant)
+                    self.any_player_max_hp_over(hp) && self.npc_alive(NpcKind::Merchant)
                 }
             };
             if !condition_met {
@@ -324,7 +321,10 @@ impl Sim {
         let (sx, sy) = homes
             .iter()
             .fold((0u64, 0u64), |a, h| (a.0 + h.0 as u64, a.1 + h.1 as u64));
-        ((sx / homes.len() as u64) as u32, (sy / homes.len() as u64) as u32)
+        (
+            (sx / homes.len() as u64) as u32,
+            (sy / homes.len() as u64) as u32,
+        )
     }
 
     fn occupied_homes(&self) -> Vec<(u32, u32)> {
@@ -536,7 +536,10 @@ impl Sim {
     }
 
     /// `SellItem` (§7.3): the merchant buys anything back at 20% of value
-    /// (rounded down); zero-value items are unsellable.
+    /// (rounded down). Zero-value items are unsellable, and so are coins —
+    /// `sell_price` is 0 for both, so the refusal below is the
+    /// authoritative guard against clients selling currency at 20% of face
+    /// value.
     pub(crate) fn sell_item(&mut self, player_id: u32, npc_id: u32, slot: u8, count: u16) {
         if !self.npc_kind_in_reach(player_id, npc_id, NpcKind::Merchant) {
             return;
@@ -726,7 +729,7 @@ impl Sim {
         let Some(p) = self.players.get(&player_id) else {
             return;
         };
-        let held_changed = changed.iter().any(|&i| i == p.held_slot as usize);
+        let held_changed = changed.contains(&(p.held_slot as usize));
         let deltas: Vec<(u8, Option<InvSlot>)> = changed
             .into_iter()
             .filter(|&i| i < p.inventory.len())
@@ -1054,6 +1057,34 @@ mod tests {
     }
 
     #[test]
+    fn offline_players_count_toward_arrival_conditions() {
+        use super::super::game::SimCommand;
+        let mut sim = flat_sim(300, 60, FLOOR);
+        build_house(&mut sim, 160, FLOOR);
+        build_house(&mut sim, 180, FLOOR);
+        let (a, _ea, _rx_a) = join(&mut sim, "alice");
+        let (b, eb, _rx_b) = join(&mut sim, "bob");
+        // Bob holds most of the wealth and the Life Crystal HP, then logs
+        // off: §7.2 says "All players" / "Any player", not "online".
+        give(&mut sim, a, 5, ItemId::SilverCoin, 10);
+        give(&mut sim, b, 5, ItemId::SilverCoin, 40);
+        sim.players.get_mut(&b).expect("p").max_hp = 120;
+        sim.handle(SimCommand::Disconnect {
+            player_id: b,
+            epoch: eb,
+        });
+        assert!(!sim.players.contains_key(&b), "bob parked offline");
+        assert_eq!(coins_of(&sim, a), 1_000, "only 10 SC remain online");
+
+        advance_to_hour(&mut sim);
+        assert!(
+            sim.npc_alive(NpcKind::Merchant),
+            "parked coins counted toward 50 SC"
+        );
+        assert!(sim.npc_alive(NpcKind::Nurse), "parked max HP > 100 counted");
+    }
+
+    #[test]
     fn dead_npcs_respawn_at_dawn_only_with_valid_housing() {
         let mut sim = flat_sim(300, 60, FLOOR);
         let sage = sim.npc_id_of_kind(NpcKind::Sage).expect("sage");
@@ -1107,6 +1138,48 @@ mod tests {
         let npc_home = sim.town.npcs[&sage].home;
         assert_ne!(npc_home, Some(home), "stale claim revalidated away");
         assert_eq!(npc_home, None);
+    }
+
+    #[test]
+    fn dawn_evicts_cohabitants_when_occupied_rooms_merge() {
+        let mut sim = flat_sim(300, 60, FLOOR);
+        build_house(&mut sim, 160, FLOOR);
+        build_house(&mut sim, 172, FLOOR);
+        advance_to_dawn(&mut sim);
+        let sage = sim.npc_id_of_kind(NpcKind::Sage).expect("sage");
+        let sage_home = sim.town.npcs[&sage].home.expect("sage housed");
+        // House a Merchant in the other room directly (arrival conditions
+        // are exercised elsewhere).
+        let other =
+            find_vacant_house(&sim.world, sim.world.spawn, &[sage_home]).expect("second house");
+        assert_ne!(other.home, sage_home);
+        let feet = (other.home.0 as f32 + 0.5, (other.home.1 + 1) as f32);
+        sim.spawn_town_npc(NpcKind::Merchant, feet, Some(other.home));
+
+        // Knock out the dividing walls (and the second door): the two
+        // occupied rooms become one room, still §7.1-valid by rules 1–6.
+        for x in [170u32, 171] {
+            for dy in 1..=4u32 {
+                let mut t = sim.world().tile(x, FLOOR - dy);
+                t.id = TileId::Air;
+                t.state = 0;
+                sim.change_tile(x, FLOOR - dy, t);
+            }
+        }
+        let merged = check_house(&sim.world, sage_home).expect("merged room valid");
+        assert!(merged.contains(other.home), "one room holds both homes");
+
+        // Dawn revalidation applies rule 7: exactly one NPC keeps a home
+        // (the other finds no vacant room — the merged one is taken).
+        advance_to_dawn(&mut sim);
+        let housed: Vec<NpcKind> = sim
+            .town
+            .npcs
+            .values()
+            .filter(|n| n.home.is_some())
+            .map(|n| n.kind)
+            .collect();
+        assert_eq!(housed, vec![NpcKind::Sage], "first by id keeps the room");
     }
 
     #[test]
@@ -1179,8 +1252,13 @@ mod tests {
     }
 
     /// Sets up a sim with a housed merchant next to the player.
-    fn merchant_sim() -> (Sim, u32, u64, tokio::sync::mpsc::Receiver<super::super::game::Frame>, u32)
-    {
+    fn merchant_sim() -> (
+        Sim,
+        u32,
+        u64,
+        tokio::sync::mpsc::Receiver<super::super::game::Frame>,
+        u32,
+    ) {
         let mut sim = flat_sim(300, 60, FLOOR);
         build_house(&mut sim, 145, FLOOR);
         let (a, ea, mut rx) = join(&mut sim, "alice");
@@ -1373,6 +1451,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn coins_cannot_be_sold_to_the_merchant() {
+        let (mut sim, a, ea, mut rx, merchant) = merchant_sim();
+        let start = coins_of(&sim, a);
+        // §7.3 "buys back any item" doesn't cover currency: 10 SC would
+        // fetch 200 CC and destroy the other 800. The server refuses no
+        // matter what gesture the client routed here.
+        msg(
+            &mut sim,
+            a,
+            ea,
+            ClientMessage::SellItem {
+                npc_id: merchant,
+                slot: 5,
+                count: 10,
+            },
+        );
+        assert_eq!(coins_of(&sim, a), start, "wallet untouched");
+        assert_eq!(
+            sim.players[&a].inventory[5],
+            Some(InvSlot::new(ItemId::SilverCoin, 50)),
+            "coin stack untouched"
+        );
+        assert!(drain(&mut rx)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Toast { text } if text.contains("won't buy"))));
+    }
+
     /// Housed merchant + nurse next to the player. The receiver must stay
     /// alive (a closed outbound channel kicks the session).
     #[allow(clippy::type_complexity)]
@@ -1500,10 +1606,7 @@ mod tests {
             &mut sim,
             a,
             ea,
-            ClientMessage::SetBedSpawn {
-                x: 150,
-                y: FLOOR,
-            },
+            ClientMessage::SetBedSpawn { x: 150, y: FLOOR },
         );
         assert_eq!(sim.players[&a].bed_spawn, Some((152, FLOOR - 2)));
 
@@ -1519,6 +1622,17 @@ mod tests {
         advance_to_dawn(&mut sim);
         let sage = sim.npc_id_of_kind(NpcKind::Sage).expect("sage");
         let home = sim.town.npcs[&sage].home.expect("housed");
+
+        // The dawn claim re-anchored the leash from the world spawn (where
+        // the homeless Sage wandered up to 25 tiles out) to the new home:
+        // it may legally start outside the new leash, so let it stroll back
+        // inside before holding it to the bound.
+        for _ in 0..6000 {
+            if (sim.town.npcs[&sage].center().0 - home.0 as f32).abs() <= NPC_WANDER_RADIUS {
+                break;
+            }
+            sim.tick();
+        }
 
         // A day of wandering: never strays past the §7.1 leash (+ slack
         // for the in-flight stretch when the leash flips the direction).
@@ -1607,6 +1721,30 @@ mod tests {
         let p = &sim.players[&a];
         assert_eq!((p.hp, p.max_hp), (77, 140));
         assert_eq!(p.bed_spawn, Some((152, FLOOR - 2)));
+    }
+
+    #[test]
+    fn sheltered_npcs_still_broadcast_snapshots() {
+        let (mut sim, _a, _ea, mut rx, merchant) = merchant_sim();
+        // A night-sheltered NPC moves nothing, so `step_town_npcs` leaves
+        // its entity asleep — but snapshots must keep flowing (NPCs get no
+        // spawn-message re-sync on chunk re-subscribe; a stale mirror makes
+        // talk/heal/shop intents fail the server range check against the
+        // real position).
+        sim.entities
+            .map
+            .get_mut(&merchant)
+            .expect("merchant entity")
+            .awake = false;
+        sim.broadcast_entity_updates();
+        let seen = drain(&mut rx).into_iter().any(|m| {
+            matches!(
+                m,
+                ServerMessage::EntityUpdate { entities }
+                    if entities.iter().any(|e| e.id == merchant)
+            )
+        });
+        assert!(seen, "NPC snapshots are exempt from the awake gate");
     }
 
     #[test]
