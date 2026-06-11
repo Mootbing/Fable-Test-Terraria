@@ -633,10 +633,26 @@ pub struct PlayerDraw<'a> {
     pub name: &'a str,
     pub is_self: bool,
     pub held_item: Option<ItemId>,
+    /// Live §4.1 use animation: (progress 0..1, is_bow) from
+    /// [`crate::interact::Interact::swing`]. Melee items sweep an arc, bows
+    /// draw back. `None` between uses (and always for remote players — the
+    /// wire doesn't carry swing timing).
+    pub swing: Option<(f32, bool)>,
     /// 0–1 brightness at the player's center tile
     /// ([`LightEngine::brightness_at`]); multiplies the sprite colors.
     pub light: f32,
 }
+
+/// Melee swing arc, degrees from horizontal-forward (negative = above):
+/// the item sweeps from overhead down past level over the use time.
+const SWING_START_DEG: f32 = -110.0;
+const SWING_END_DEG: f32 = 40.0;
+/// Swing pivot ("shoulder") px below the AABB top, and blade size.
+const SWING_PIVOT_PX: f32 = 16.0;
+const SWING_LEN_PX: f32 = 17.0;
+const SWING_THICK_PX: f32 = 4.0;
+/// Bow draw-back: how far the bow pulls toward the body at full draw.
+const BOW_PULL_PX: f32 = 4.0;
 
 /// Multiplies a color's RGB by a light factor (alpha untouched).
 pub fn lit_color(c: Color, l: f32) -> Color {
@@ -682,10 +698,47 @@ pub fn draw_player(p: &PlayerDraw) {
     let eye_dx = p.facing as f32 * 3.0;
     draw_circle(x + w * 0.5 + eye_dx, y + 6.0, 1.6, EYE);
 
-    // Held item, as a small swatch in the leading hand.
+    // Held item: a small swatch in the leading hand, or its live §4.1 use
+    // animation — a rotation arc for melee swings, a draw-back for bows.
     if let Some(item) = p.held_item {
-        let hx = if p.facing >= 0 { x + w - 1.0 } else { x - 5.0 };
-        draw_rectangle(hx, y + 18.0, 6.0, 6.0, lit_color(item_color(item), l));
+        let color = lit_color(item_color(item), l);
+        let dir = if p.facing >= 0 { 1.0 } else { -1.0 };
+        match p.swing {
+            Some((t, false)) => {
+                // Melee: the item sweeps an arc around the shoulder.
+                let deg = SWING_START_DEG + (SWING_END_DEG - SWING_START_DEG) * t;
+                let a = deg.to_radians();
+                // Mirror across the vertical axis when facing left.
+                let rot = if dir >= 0.0 {
+                    a
+                } else {
+                    std::f32::consts::PI - a
+                };
+                draw_rectangle_ex(
+                    x + w * 0.5,
+                    y + SWING_PIVOT_PX,
+                    SWING_LEN_PX,
+                    SWING_THICK_PX,
+                    DrawRectangleParams {
+                        offset: vec2(0.0, 0.5), // pivot at the hand end
+                        rotation: rot,
+                        color,
+                    },
+                );
+            }
+            Some((t, true)) => {
+                // Bow: the swatch pulls back toward the body as it draws,
+                // with a taut "string" line at the leading edge.
+                let pull = dir * BOW_PULL_PX * t;
+                let hx = if p.facing >= 0 { x + w - 1.0 } else { x - 5.0 } - pull;
+                draw_rectangle(hx, y + 18.0, 6.0, 6.0, color);
+                draw_line(hx + 3.0, y + 16.0, hx + 3.0, y + 26.0, 1.0, color);
+            }
+            None => {
+                let hx = if p.facing >= 0 { x + w - 1.0 } else { x - 5.0 };
+                draw_rectangle(hx, y + 18.0, 6.0, 6.0, color);
+            }
+        }
     }
 
     // Name label, centered above the head.

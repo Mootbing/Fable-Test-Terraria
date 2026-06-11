@@ -8,8 +8,8 @@ use ferraria_shared::items::ItemId;
 use ferraria_shared::physics::{
     step_player_with_mods, PhysicsMods, PlayerInput, PlayerPhysics, StepResult,
 };
-use ferraria_shared::protocol::{anim, ClientMessage};
-use ferraria_shared::{DT, SNAPSHOT_INTERVAL_TICKS};
+use ferraria_shared::protocol::{anim, ActiveDebuff, ClientMessage, Debuff};
+use ferraria_shared::{DT, PLAYER_BASE_MAX_HP, SNAPSHOT_INTERVAL_TICKS, TICK_RATE};
 
 /// Cap on frame time fed into the fixed-step accumulator, so a hidden tab
 /// resuming doesn't burst hundreds of physics ticks.
@@ -41,6 +41,11 @@ pub struct OwnPlayer {
     /// Last `PlayerState` actually sent; suppresses idle resends so the
     /// server's `moved` flag (and rebroadcast traffic) stays quiet.
     last_sent: Option<ClientMessage>,
+    /// A Gust Jar mid-air jump happened since the last sent state. One-shot:
+    /// ORed into the next `PlayerState` anim byte so the server resets its
+    /// observed fall distance (§8 / `protocol::anim::AIR_JUMPED`), then
+    /// cleared.
+    air_jumped: bool,
 }
 
 impl OwnPlayer {
@@ -61,6 +66,7 @@ impl OwnPlayer {
             tick: 0,
             last_step: StepResult::default(),
             last_sent: None,
+            air_jumped: false,
         }
     }
 
@@ -89,22 +95,44 @@ impl OwnPlayer {
             if input.left != input.right {
                 self.facing = if input.right { 1 } else { -1 };
             }
+            // The shared step consumes Gust Jar air jumps itself; an
+            // `air_jumps_used` increment across the step is the only signal
+            // (the counter resets to 0 on landing/swimming, never +1s).
+            let jumps_before = self.phys.air_jumps_used;
             self.last_step = step_player_with_mods(world, &mut self.phys, input, DT, mods);
+            if self.phys.air_jumps_used > jumps_before {
+                self.air_jumped = true;
+            }
             self.tick += 1;
             if self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS as u64) {
+                let mut anim = self.anim_flags();
+                if self.air_jumped {
+                    anim |= anim::AIR_JUMPED; // one-shot (§8 fall negation)
+                }
                 let state = ClientMessage::PlayerState {
                     pos: self.phys.pos,
                     vel: self.phys.vel,
                     facing: self.facing,
-                    anim: self.anim_flags(),
+                    anim,
                 };
                 if self.last_sent.as_ref() != Some(&state) {
                     self.last_sent = Some(state.clone());
                     out.push(state);
+                    self.air_jumped = false;
                 }
             }
         }
         out
+    }
+
+    /// `ServerMessage::PlayerKnockback` (enemy contact / projectile hit):
+    /// movement is client-authoritative, so the server can't shove us — it
+    /// asks, and we add the impulse to the predicted velocity.
+    pub fn apply_knockback(&mut self, vx: f32, vy: f32) {
+        self.phys.vel.0 += vx;
+        self.phys.vel.1 += vy;
+        // A shove interrupts a held-jump rise, like releasing the key.
+        self.phys.jump_hold_left = 0.0;
     }
 
     /// Applies an authoritative own-id correction (teleport rejection /
@@ -152,6 +180,16 @@ pub struct Snapshot {
 pub struct RemotePlayer {
     pub name: String,
     pub held_item: Option<ItemId>,
+    /// Server-authoritative HP mirror (`PlayerHealth` broadcasts) — drives
+    /// the small health bar over hurt teammates.
+    pub hp: u16,
+    pub max_hp: u16,
+    /// Dead until `PlayerRespawned` (§8): hidden while down, like the
+    /// server expects (a corpse can't be hit, lit, or interpolated).
+    pub dead: bool,
+    /// Wall-clock time their Darkness debuff wears off (§5.2/§10: remote
+    /// victims' glow is dimmed too); `NEG_INFINITY` when not afflicted.
+    darkness_until: f64,
     snaps: VecDeque<Snapshot>,
 }
 
@@ -168,6 +206,10 @@ impl RemotePlayer {
         RemotePlayer {
             name,
             held_item: None,
+            hp: PLAYER_BASE_MAX_HP as u16,
+            max_hp: PLAYER_BASE_MAX_HP as u16,
+            dead: false,
+            darkness_until: f64::NEG_INFINITY,
             snaps,
         }
     }
@@ -177,6 +219,33 @@ impl RemotePlayer {
             self.snaps.pop_front();
         }
         self.snaps.push_back(snap);
+    }
+
+    /// `PlayerDebuffs` replacement list: remember when Darkness wears off
+    /// (the only remote-relevant debuff — it dims their glow, §10).
+    pub fn set_debuffs(&mut self, debuffs: &[ActiveDebuff], now: f64) {
+        self.darkness_until = debuffs
+            .iter()
+            .find(|d| d.debuff == Debuff::Darkness)
+            .map(|d| now + d.remaining_ticks as f64 / TICK_RATE as f64)
+            .unwrap_or(f64::NEG_INFINITY);
+    }
+
+    pub fn has_darkness(&self, now: f64) -> bool {
+        now < self.darkness_until
+    }
+
+    /// `PlayerRespawned`: drop the stale snapshot history so they pop in at
+    /// the respawn point instead of interpolating across the map.
+    pub fn reset_to(&mut self, pos: (f32, f32), now: f64) {
+        self.snaps.clear();
+        self.snaps.push_back(Snapshot {
+            t: now,
+            pos,
+            vel: (0.0, 0.0),
+            facing: 1,
+            anim: anim::GROUNDED,
+        });
     }
 
     /// State to draw at `render_t` (typically `now - INTERP_DELAY`):
@@ -227,5 +296,91 @@ impl RemotePlayer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferraria_shared::tiles::{Tile, TileId};
+    use ferraria_shared::world::World;
+
+    fn flat_world() -> World {
+        let mut w = World::new(64, 64);
+        for x in 0..64 {
+            for y in 40..64 {
+                w.set_tile(x, y, Tile::of(TileId::Stone));
+            }
+        }
+        w
+    }
+
+    fn drive(
+        own: &mut OwnPlayer,
+        world: &World,
+        input: PlayerInput,
+        mods: PhysicsMods,
+        ticks: u32,
+        msgs: &mut Vec<ClientMessage>,
+    ) {
+        for _ in 0..ticks {
+            msgs.extend(own.update(world, input, DT, false, mods));
+        }
+    }
+
+    /// §8 / protocol.rs `anim::AIR_JUMPED`: a Gust Jar mid-air jump
+    /// consumed by the shared step raises the flag on exactly one
+    /// `PlayerState` (the next send), then clears.
+    #[test]
+    fn air_jump_flags_exactly_one_player_state() {
+        let world = flat_world();
+        let mods = PhysicsMods {
+            extra_air_jumps: 1,
+            ..PhysicsMods::NONE
+        };
+        let mut own = OwnPlayer::at(PlayerPhysics::from_feet(32.0, 40.0));
+        let jump = PlayerInput {
+            jump: true,
+            ..PlayerInput::default()
+        };
+        let idle = PlayerInput::default();
+        let mut msgs = Vec::new();
+
+        // Settle onto the floor first (`on_ground` resolves on stepping).
+        drive(&mut own, &world, idle, mods, 5, &mut msgs);
+        assert!(own.phys.on_ground, "settled");
+        // Ground jump, then release so the next press has an edge.
+        drive(&mut own, &world, jump, mods, 10, &mut msgs);
+        assert!(!own.phys.on_ground, "airborne after the ground jump");
+        drive(&mut own, &world, idle, mods, 6, &mut msgs);
+        assert_eq!(own.phys.air_jumps_used, 0);
+        msgs.clear();
+
+        // Mid-air press: the step consumes the air jump...
+        drive(&mut own, &world, jump, mods, 6, &mut msgs);
+        assert_eq!(own.phys.air_jumps_used, 1, "air jump consumed");
+        // ...and the flag rides exactly one of the following states.
+        drive(&mut own, &world, jump, mods, 30, &mut msgs);
+        let flagged = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, ClientMessage::PlayerState { anim, .. }
+                    if anim & anim::AIR_JUMPED != 0)
+            })
+            .count();
+        assert!(msgs.len() > 1, "several states sent while airborne");
+        assert_eq!(flagged, 1, "AIR_JUMPED is one-shot");
+    }
+
+    /// `PlayerKnockback` adds to the predicted velocity (the server can't
+    /// move a client-authoritative body) and cancels a held-jump rise.
+    #[test]
+    fn knockback_adds_to_velocity() {
+        let mut own = OwnPlayer::at(PlayerPhysics::from_feet(32.0, 40.0));
+        own.phys.vel = (2.0, -1.0);
+        own.phys.jump_hold_left = 0.1;
+        own.apply_knockback(-8.0, -4.0);
+        assert_eq!(own.phys.vel, (-6.0, -5.0));
+        assert_eq!(own.phys.jump_hold_left, 0.0);
     }
 }
