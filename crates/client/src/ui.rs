@@ -15,7 +15,8 @@ use std::collections::VecDeque;
 
 use macroquad::prelude::*;
 
-use ferraria_shared::CHAT_MAX_CHARS;
+use ferraria_shared::protocol::{ActiveDebuff, Debuff};
+use ferraria_shared::{CHAT_MAX_CHARS, LIFE_CRYSTAL_HP, PLAYER_MAX_BREATH, TICK_RATE};
 
 const TITLE: &str = "FERRARIA";
 
@@ -149,6 +150,33 @@ pub enum DisconnectedChoice {
     Menu,
 }
 
+/// Full-screen §8 death overlay drawn over the (still live) world: a dim,
+/// the death text, and the respawn control — a countdown while the server's
+/// §8 timer (10 s) runs, then a button. Returns true on a Respawn click.
+/// Per-frame formatting is fine here, like [`draw_connecting`] — this only
+/// runs while dead.
+pub fn draw_death_screen(secs_left: f64) -> bool {
+    draw_rectangle(
+        0.0,
+        0.0,
+        screen_width(),
+        screen_height(),
+        Color::new(0.08, 0.0, 0.0, 0.55),
+    );
+    let cx = screen_width() * 0.5;
+    let cy = screen_height() * 0.42;
+    let w = measure_text("You died", None, 64, 1.0).width;
+    shadow_text("You died", cx - w * 0.5, cy, 64.0, ERROR_COLOR);
+    if secs_left > 0.0 {
+        let msg = format!("Respawn in {}s", secs_left.ceil() as u32);
+        let mw = measure_text(&msg, None, 26, 1.0).width;
+        shadow_text(&msg, cx - mw * 0.5, cy + 56.0, 26.0, TEXT_COLOR);
+        false
+    } else {
+        button(cx - 90.0, cy + 28.0, 180.0, 48.0, "Respawn")
+    }
+}
+
 pub fn draw_disconnected(reason: &str) -> DisconnectedChoice {
     clear_background(Color::new(0.10, 0.06, 0.07, 1.0));
     let cx = screen_width() * 0.5;
@@ -168,13 +196,42 @@ pub fn draw_disconnected(reason: &str) -> DisconnectedChoice {
 
 // ---- HUD --------------------------------------------------------------------------
 
-/// Top-left status block + F3 debug overlay, with cached strings.
+/// Survival HUD layout (§8), top-right: one heart per 20 max HP (Life
+/// Crystals add hearts, 400 max HP = 20), rows of 10; a breath bar shown
+/// only while the meter isn't full; debuff badges with remaining time.
+const HEART_PX: f32 = 15.0;
+const HEART_GAP: f32 = 4.0;
+const HEARTS_PER_ROW: usize = 10;
+const HUD_RIGHT_MARGIN: f32 = 12.0;
+const HUD_TOP: f32 = 14.0;
+const HEART_BG: Color = Color::new(0.20, 0.04, 0.06, 0.80);
+const HEART_FILL: Color = Color::new(0.88, 0.18, 0.25, 0.95);
+const BREATH_BG: Color = Color::new(0.02, 0.08, 0.16, 0.80);
+const BREATH_FILL: Color = Color::new(0.35, 0.75, 0.95, 0.95);
+const BREATH_H: f32 = 7.0;
+
+/// Display name + badge color of a §8 debuff.
+fn debuff_style(d: Debuff) -> (&'static str, Color) {
+    match d {
+        Debuff::Burning => ("Burning", Color::new(1.0, 0.55, 0.15, 1.0)),
+        Debuff::Darkness => ("Darkness", Color::new(0.55, 0.35, 0.85, 1.0)),
+        Debuff::PotionSickness => ("Potion Sickness", Color::new(0.85, 0.45, 0.75, 1.0)),
+    }
+}
+
+/// Top-left status block, the top-right §8 survival block, + F3 debug
+/// overlay, with cached strings.
 pub struct Hud {
     pub debug: bool,
     clock_text: String,
     clock_key: (u32, u32),
     players_text: String,
     players_key: usize,
+    hp_text: String,
+    hp_key: (u16, u16),
+    /// Debuff badge labels, rebuilt only when a displayed second changes.
+    debuff_labels: Vec<(Debuff, u32, String)>,
+    debuff_key: Vec<(Debuff, u32)>,
     debug_lines: Vec<String>,
     debug_at: f64,
 }
@@ -187,6 +244,10 @@ impl Hud {
             clock_key: (u32::MAX, u32::MAX),
             players_text: String::new(),
             players_key: usize::MAX,
+            hp_text: String::new(),
+            hp_key: (u16::MAX, u16::MAX),
+            debuff_labels: Vec::new(),
+            debuff_key: Vec::new(),
             debug_lines: Vec::new(),
             debug_at: f64::NEG_INFINITY,
         }
@@ -204,6 +265,116 @@ impl Hud {
         }
         shadow_text(&self.players_text, 12.0, 24.0, 22.0, TEXT_COLOR);
         shadow_text(&self.clock_text, 12.0, 48.0, 22.0, TEXT_COLOR);
+    }
+
+    /// Top-right §8 survival block: hearts, "hp/max", the breath bar (only
+    /// while below the 200 max), and debuff badges with remaining time
+    /// (ticks synced by `PlayerDebuffs` at `debuffs_at`, counted down
+    /// locally).
+    pub fn draw_survival(
+        &mut self,
+        hp: u16,
+        max_hp: u16,
+        breath: u16,
+        debuffs: &[ActiveDebuff],
+        debuffs_at: f64,
+        now: f64,
+    ) {
+        let sw = screen_width();
+        // Hearts: one per 20 max HP (§8: 100 base + 20/Life Crystal).
+        let hearts = (max_hp as u32).div_ceil(LIFE_CRYSTAL_HP).max(1) as usize;
+        let rows = hearts.div_ceil(HEARTS_PER_ROW);
+        for i in 0..hearts {
+            let row = i / HEARTS_PER_ROW;
+            let col = i % HEARTS_PER_ROW;
+            let row_len = (hearts - row * HEARTS_PER_ROW).min(HEARTS_PER_ROW);
+            let x = sw - HUD_RIGHT_MARGIN - ((row_len - col) as f32) * (HEART_PX + HEART_GAP)
+                + HEART_GAP;
+            let y = HUD_TOP + row as f32 * (HEART_PX + HEART_GAP);
+            draw_rectangle(x, y, HEART_PX, HEART_PX, HEART_BG);
+            let fill = (hp as i32 - (i as u32 * LIFE_CRYSTAL_HP) as i32)
+                .clamp(0, LIFE_CRYSTAL_HP as i32) as f32
+                / LIFE_CRYSTAL_HP as f32;
+            if fill > 0.0 {
+                draw_rectangle(
+                    x,
+                    y + HEART_PX * (1.0 - fill),
+                    HEART_PX,
+                    HEART_PX * fill,
+                    HEART_FILL,
+                );
+            }
+            draw_rectangle_lines(
+                x,
+                y,
+                HEART_PX,
+                HEART_PX,
+                1.0,
+                Color::new(1.0, 1.0, 1.0, 0.25),
+            );
+        }
+        let mut next_y = HUD_TOP + rows as f32 * (HEART_PX + HEART_GAP) + 12.0;
+        if (hp, max_hp) != self.hp_key {
+            self.hp_key = (hp, max_hp);
+            self.hp_text = format!("{hp}/{max_hp}");
+        }
+        let dims = measure_text(&self.hp_text, None, 18, 1.0);
+        shadow_text(
+            &self.hp_text,
+            sw - HUD_RIGHT_MARGIN - dims.width,
+            next_y,
+            18.0,
+            DIM_TEXT,
+        );
+        next_y += 12.0;
+
+        // Breath (§8: 200 max), shown only while not full.
+        if (breath as u32) < PLAYER_MAX_BREATH {
+            let bw = HEARTS_PER_ROW as f32 * (HEART_PX + HEART_GAP) - HEART_GAP;
+            let x = sw - HUD_RIGHT_MARGIN - bw;
+            draw_rectangle(x, next_y, bw, BREATH_H, BREATH_BG);
+            draw_rectangle(
+                x,
+                next_y,
+                bw * breath as f32 / PLAYER_MAX_BREATH as f32,
+                BREATH_H,
+                BREATH_FILL,
+            );
+            next_y += BREATH_H + 10.0;
+        } else {
+            next_y += 4.0;
+        }
+
+        // Debuff badges (§8: Burning, Darkness, Potion Sickness). Labels
+        // reformat only when a displayed second changes.
+        self.debuff_key.clear();
+        for d in debuffs {
+            let left = d.remaining_ticks as f64 / TICK_RATE as f64 - (now - debuffs_at);
+            if left > 0.0 {
+                self.debuff_key.push((d.debuff, left.ceil() as u32));
+            }
+        }
+        let stale = self.debuff_labels.len() != self.debuff_key.len()
+            || self
+                .debuff_labels
+                .iter()
+                .zip(&self.debuff_key)
+                .any(|(l, k)| (l.0, l.1) != *k);
+        if stale {
+            self.debuff_labels = self
+                .debuff_key
+                .iter()
+                .map(|&(d, s)| (d, s, format!("{} {}s", debuff_style(d).0, s)))
+                .collect();
+        }
+        for (d, _, label) in &self.debuff_labels {
+            let (_, color) = debuff_style(*d);
+            let dims = measure_text(label, None, 18, 1.0);
+            let tx = sw - HUD_RIGHT_MARGIN - dims.width;
+            draw_rectangle(tx - 17.0, next_y, 12.0, 12.0, color);
+            shadow_text(label, tx, next_y + 11.0, 18.0, TEXT_COLOR);
+            next_y += 19.0;
+        }
     }
 
     /// F3 overlay: fps, position, chunk count, bad frames, light timings.
